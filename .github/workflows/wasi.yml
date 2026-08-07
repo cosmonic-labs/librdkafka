@@ -274,13 +274,31 @@ jobs:
             -DRDKAFKA_BUILD_TESTS=ON -DWITH_SASL=OFF -DWITH_CURL=OFF
           cmake --build build-native -j"$(nproc)"
 
+      - name: Stage the interceptor fixture
+        # 0066_plugins dlopens `interceptor_test/interceptor_test.so` relative to
+        # its cwd, but an out-of-tree build writes it to
+        # build-native/tests/interceptor_test/. Copy it next to the sources
+        # rather than running the suite from the build tree: other tests read
+        # source-relative fixtures (0053 opens ../src/statistics_schema.json),
+        # so cwd has to stay in tests/.
+        #
+        # The fixture is Linux-only — tests/CMakeLists.txt gates it on
+        # `NOT WIN32 AND NOT APPLE` — so on macOS 0066 simply skips and this
+        # whole failure mode is invisible to a developer machine.
+        run: |
+          set -euo pipefail
+          so=build-native/tests/interceptor_test/interceptor_test.so
+          [ -f "$so" ] || { echo "::error::$so not built; 0066_plugins would fail on a missing fixture"; exit 1; }
+          cp "$so" tests/interceptor_test/
+          ls -l tests/interceptor_test/interceptor_test.so
+
       - name: Run librdkafka local test suite
         # -l restricts to tests that need no broker, so this stays hermetic.
         run: |
           set -euo pipefail
           cd tests
           TESTS_SKIP_UNSUPPORTED=y RDKAFKA_TEST_CONF=/dev/null TEST_LEVEL=2 \
-            ../build-native/tests/test-runner -l -Q 2>&1 | tee /tmp/suite.log
+            ./../build-native/tests/test-runner -l -Q 2>&1 | tee /tmp/suite.log
           # Count from the results table, not raw log text: broker error strings
           # such as TOPIC_AUTHORIZATION_FAILED appear inside passing mock tests
           # and would otherwise be miscounted as failures.
