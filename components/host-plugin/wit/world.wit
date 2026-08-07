@@ -1,0 +1,50 @@
+package cosmonic:librdkafka@0.1.0;
+
+/// The Kafka capability provided by librdkafka, as a wasmCloud host component
+/// plugin.
+///
+/// A separate package from `cosmonic:kafka` on purpose: that one is the
+/// interface contract, published for workloads to consume, and it should not
+/// name an implementation. This world is one implementation of it.
+///
+/// ## Why this exports `wasi:cli/run`
+///
+/// Not a convenience. librdkafka is built here with a cooperative scheduler
+/// standing in for its threads, and that scheduler only advances when something
+/// pumps it. Capability calls pump it as a side effect — every blocking wait
+/// inside librdkafka funnels through a pump point — but between calls nothing
+/// does.
+///
+/// A Kafka client that stops running between calls loses its consumer group:
+/// heartbeats stop, `max.poll.interval.ms` elapses, and the coordinator evicts
+/// the member. Metadata refresh and produce retries stall the same way. So the
+/// plugin needs somewhere to run continuously, and `wasi:cli/run` is that
+/// place — the host calls it once at startup and it drives `rd_wasm_pump()` for
+/// the life of the plugin.
+world host-plugin {
+    /// The capability, served across store boundaries to bound workloads.
+    export cosmonic:kafka/types@0.1.0;
+    export cosmonic:kafka/producer@0.1.0;
+    export cosmonic:kafka/consumer@0.1.0;
+    export cosmonic:kafka/admin@0.1.0;
+
+    /// Per-workload provisioning: each workload's brokers and credentials
+    /// arrive here, and this is where its client is opened.
+    export wasmcloud:host/workload-lifecycle@0.1.1;
+
+    /// The scheduler pump. See above — this is what keeps group membership
+    /// alive between capability calls.
+    export wasi:cli/run@0.3.0;
+
+    /// Which workload is calling. Capability calls carry no binding identity,
+    /// so this is the only way to select that tenant's client.
+    import wasmcloud:host/identity@0.1.1;
+
+    /// Cooperative cancellation, so a long fetch can be unwound rather than
+    /// occupying the plugin.
+    import wasmcloud:host/cancel@0.1.1;
+
+    /// The pump loop's yield point. Without a suspension between passes the
+    /// run loop starves the capability calls it exists to keep alive.
+    import wasi:clocks/monotonic-clock@0.3.0;
+}
