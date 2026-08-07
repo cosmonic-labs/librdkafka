@@ -1,0 +1,256 @@
+name: WIT
+
+# Validates and publishes the `cosmonic:kafka` WIT package as an OCI artifact.
+#
+# Deliberately independent of the WASI build workflow: the interface is
+# consumed by workloads that never build librdkafka, so it must be publishable
+# without a toolchain, a broker, or a successful component build.
+#
+# Validation runs on every push and PR. Publishing runs only on a `wit-v*` tag
+# or a manual dispatch — a merge to main should not silently move a version
+# that other repos resolve against.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "wit/**"
+      - ".github/workflows/wit-publish.yml"
+    tags: ["wit-v*"]
+  pull_request:
+    paths:
+      - "wit/**"
+      - ".github/workflows/wit-publish.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "OCI tag to publish (defaults to the version in wit/)"
+        required: false
+        type: string
+
+env:
+  # wkg's OCI convention is `<registry>/<prefix>/<namespace>/<package>:<version>`
+  # — the same shape as `ghcr.io/webassembly/wasi/http:0.2.1`. The path is not a
+  # naming preference: wkg derives it from the package name when resolving, so a
+  # package published anywhere else cannot be auto-resolved and every consumer
+  # needs a manual override instead.
+  #
+  # Registry base and namespace prefix. The namespace and package segments are
+  # read from the WIT itself so a package rename cannot silently publish to a
+  # stale path.
+  OCI_REGISTRY: ghcr.io
+  OCI_NAMESPACE_PREFIX: ${{ github.repository_owner }}
+
+jobs:
+  validate:
+    name: Validate and encode
+    runs-on: ubuntu-24.04
+    outputs:
+      namespace: ${{ steps.meta.outputs.namespace }}
+      package: ${{ steps.meta.outputs.package }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/wasmcloud/wasmCloud/main/install.sh | bash
+          echo "$HOME/.wash/bin" >> "$GITHUB_PATH"
+
+      - name: Install wasm-tools
+        # Only for the round-trip assertion below; `wash wit build` does the
+        # encoding.
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/bytecodealliance/wasm-tools/releases/latest/download/wasm-tools-$(uname -m)-linux.tar.gz" \
+            -o /tmp/wt.tar.gz
+          tar xzf /tmp/wt.tar.gz -C /tmp
+          sudo install /tmp/wasm-tools-*/wasm-tools /usr/local/bin/
+
+      - name: Versions
+        run: |
+          wash --version
+          wasm-tools --version
+
+      - name: Read package identity
+        id: meta
+        run: |
+          set -euo pipefail
+          # e.g. `package cosmonic:kafka@0.1.0;`
+          decl=$(grep -m1 -oE '^package [a-z0-9-]+:[a-z0-9-]+@[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9.+-]*' wit/world.wit)
+          [ -n "$decl" ] || { echo "::error::could not read package declaration from wit/world.wit"; exit 1; }
+          decl=${decl#package }
+          namespace=${decl%%:*}
+          rest=${decl#*:}
+          package=${rest%%@*}
+          version=${rest#*@}
+          {
+            echo "namespace=$namespace"
+            echo "package=$package"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "$namespace:$package@$version"
+
+      - name: Fetch WIT dependencies
+        # `wit/deps/` is gitignored; wkg.lock is committed and pins every
+        # dependency by digest, so this reproduces the exact tree.
+        run: wash wit fetch
+
+      - name: Fail if the lockfile moved
+        # A fetch that rewrites wkg.lock means a dependency resolved to
+        # something other than what was committed. Publishing that would ship
+        # an interface built against deps nobody reviewed.
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- wkg.lock; then
+            echo "::error::wash wit fetch changed wkg.lock — commit the updated lock deliberately"
+            git --no-pager diff -- wkg.lock
+            exit 1
+          fi
+          echo "wkg.lock unchanged"
+
+      - name: Build the WIT package
+        run: |
+          set -euo pipefail
+          wash wit build --output-file kafka-wit.wasm
+          ls -l kafka-wit.wasm
+
+      - name: Assert the artifact round-trips
+        # An encoded package that cannot be decoded is worse than a failed
+        # build: it publishes and then breaks every consumer at resolve time.
+        run: |
+          set -euo pipefail
+          wasm-tools component wit kafka-wit.wasm > decoded.wit
+          grep -q '^package cosmonic:kafka@' decoded.wit \
+            || { echo "::error::decoded package name is wrong"; exit 1; }
+          for w in producer-client consumer-service processor-service client host-plugin; do
+            grep -qE "^world $w \{" decoded.wit \
+              || { echo "::error::world '$w' missing from encoded package"; exit 1; }
+          done
+          # The error enum is the bulk of the interface's value and the part
+          # most likely to be silently truncated by an encoding change.
+          cases=$(sed -n '/enum error-code/,/^  }/p' decoded.wit | grep -cE '^\s+[a-z][a-z0-9-]*,$')
+          echo "error-code cases: $cases"
+          [ "$cases" -ge 180 ] || { echo "::error::error-code enum truncated ($cases cases)"; exit 1; }
+
+      - name: Check the enum still matches librdkafka
+        # The enum is generated from rd_kafka_resp_err_t. If the vendored
+        # librdkafka gains error codes and the WIT is not regenerated, the
+        # interface silently stops being able to represent them.
+        run: python3 wit/check-error-codes.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kafka-wit
+          path: kafka-wit.wasm
+          if-no-files-found: error
+
+  publish:
+    name: Publish to OCI
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/wit-v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kafka-wit
+
+      - name: Install wkg
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/latest/download/wkg-$(uname -m)-unknown-linux-gnu" \
+            -o /tmp/wkg
+          sudo install /tmp/wkg /usr/local/bin/wkg
+          wkg --version
+
+      - name: Resolve the conventional reference
+        id: ref
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            version="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/wit-v* ]]; then
+            # refs/tags/wit-v0.1.0 -> 0.1.0
+            version="${GITHUB_REF#refs/tags/wit-v}"
+          else
+            version="${{ needs.validate.outputs.version }}"
+          fi
+
+          # wkg ignores any tag that is not valid semver when resolving, so a
+          # `v` prefix or a codename would publish successfully and then be
+          # invisible to every consumer.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$ ]]; then
+            echo "::error::tag '$version' is not valid semver; wkg will ignore it when pulling"
+            exit 1
+          fi
+
+          # <registry>/<prefix>/<namespace>/<package>
+          repo="${OCI_REGISTRY}/${OCI_NAMESPACE_PREFIX}/${{ needs.validate.outputs.namespace }}/${{ needs.validate.outputs.package }}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing ${repo}:${version}"
+
+      - name: Refuse to overwrite an existing version
+        # A published interface version is something other repos pin. Moving
+        # one silently is how a consumer's build changes meaning without any
+        # change on their side. Re-publishing requires deleting the package
+        # version deliberately.
+        run: |
+          set -euo pipefail
+          ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
+          if wkg oci pull "$ref" -o /tmp/existing.wasm 2>/dev/null; then
+            echo "::error::$ref already exists; bump the version in wit/ instead of moving the tag"
+            exit 1
+          fi
+          echo "tag is free"
+
+      - name: Log in to the registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | wkg oci login "${OCI_REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
+          wkg oci push "$ref" kafka-wit.wasm
+          echo "published $ref"
+
+      - name: Verify what landed
+        # Pull it back and decode. Publishing an artifact nobody can resolve is
+        # the failure mode worth ten seconds to rule out.
+        run: |
+          set -euo pipefail
+          ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
+          wkg oci pull "$ref" -o /tmp/pulled.wasm
+          wasm-tools component wit /tmp/pulled.wasm | grep -m1 '^package '
+
+      - name: Summary
+        run: |
+          ns="${{ needs.validate.outputs.namespace }}"
+          pkg="${{ needs.validate.outputs.package }}"
+          ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
+          {
+            echo "### Published \`${ns}:${pkg}@${{ steps.ref.outputs.version }}\`"
+            echo
+            echo '```'
+            echo "$ref"
+            echo '```'
+            echo
+            echo "Laid out per wkg's OCI convention"
+            echo "(\`<registry>/<prefix>/<namespace>/<package>:<semver>\`), so consumers"
+            echo "resolve it by pointing the namespace at this registry rather than"
+            echo "naming the artifact:"
+            echo
+            echo '```toml'
+            echo "# wkg.toml"
+            echo "[namespace_registries]"
+            echo "${ns} = { registry = \"${OCI_REGISTRY}\", metadata = { preferredProtocol = \"oci\", \"oci\" = { registry = \"${OCI_REGISTRY}\", namespacePrefix = \"${OCI_NAMESPACE_PREFIX}/\" } } }"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

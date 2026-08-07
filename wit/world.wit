@@ -1,0 +1,183 @@
+package cosmonic:kafka@0.1.0;
+
+/// A workload that produces.
+@since(version = 0.1.0)
+world producer-client {
+    @since(version = 0.1.0)
+    import types;
+    @since(version = 0.1.0)
+    import producer;
+}
+
+/// A long-lived consumer **service**.
+///
+/// Consuming is a service, not a component. A wasmCloud component is
+/// instantiated per request and torn down after it, which leaves nowhere to
+/// hold a record stream, and — more importantly — nothing to drive the group
+/// heartbeat between requests. A consumer that stops reading is a consumer the
+/// group evicts.
+///
+/// A service instead exports `wasi:cli/run`, which the host calls once at
+/// startup and expects to block indefinitely. That single long-lived call is
+/// what owns the `stream<consumed-record>` and keeps the membership alive.
+///
+/// The shape of `run` is a loop over the stream:
+///
+/// ```text
+/// let consumer = consumer::open(config).await?;
+/// consumer.subscribe(topics).await?;
+/// let (records, done) = consumer.records();
+/// loop {
+///     select {
+///         rec = records.next() => { process(rec); consumer.commit(..).await?; }
+///         ev  = rebalances.next() => { /* commit before revoke */ }
+///     }
+/// }
+/// ```
+///
+/// Handle `rebalances` in the same loop. Records and assignment changes arrive
+/// on separate streams, and committing an offset for a partition that has
+/// already been revoked is where duplicate processing starts.
+@since(version = 0.1.0)
+world consumer-service {
+    @since(version = 0.1.0)
+    import types;
+    @since(version = 0.1.0)
+    import consumer;
+
+    /// Called once at startup; blocks for the life of the service.
+    @since(version = 0.1.0)
+    export wasi:cli/run@0.3.0;
+}
+
+/// A long-lived read-process-write **service**.
+///
+/// Consumes, transforms, and produces from the one instance. Combined with
+/// `transaction.send-offsets`, this is the exactly-once pattern: the offsets
+/// consumed and the records produced commit atomically, so a crash mid-batch
+/// replays cleanly instead of double-writing.
+@since(version = 0.1.0)
+world processor-service {
+    @since(version = 0.1.0)
+    import types;
+    @since(version = 0.1.0)
+    import consumer;
+    @since(version = 0.1.0)
+    import producer;
+
+    @since(version = 0.1.0)
+    export wasi:cli/run@0.3.0;
+}
+
+/// A workload with the full capability, including administration.
+///
+/// Producing and admin work from an ephemeral component; consuming does not —
+/// use `consumer-service` for that.
+@since(version = 0.1.0)
+world client {
+    @since(version = 0.1.0)
+    import types;
+    @since(version = 0.1.0)
+    import producer;
+    @since(version = 0.1.0)
+    import consumer;
+    @since(version = 0.1.0)
+    import admin;
+}
+
+/// The Kafka capability implemented as a wasmCloud host component plugin.
+///
+/// One long-lived, host-scoped instance serves every workload that binds to it.
+/// That split is the point: a Kafka client is stateful — connections to every
+/// broker, cached metadata, partition leadership, group membership with
+/// heartbeats — and none of it survives a per-request component instance.
+///
+/// ## Per-workload clients
+///
+/// The plugin does not hold one shared Kafka client. Kafka authorises per
+/// principal (ACLs on topics and groups), so a shared client would give every
+/// workload identical rights and defeat the isolation the sandbox exists to
+/// provide. Instead `on-workload-bind` delivers each workload's own
+/// `bootstrap.servers`, credentials and topic set, and the plugin opens a
+/// client per workload, keyed by workload id.
+///
+/// Later capability calls carry no binding information, so the plugin
+/// correlates them back with `wasmcloud:host/identity.get-workload-id()`. That
+/// identity is the only thing distinguishing one tenant's calls from another's,
+/// which makes the `identity` import mandatory rather than a convenience.
+///
+/// ## Credentials
+///
+/// A workload declares them on its interface binding, and the host merges
+/// `config` -> `configFrom` -> `secretFrom` (last wins) before delivering the
+/// result as this binding's config:
+///
+/// ```yaml
+/// hostInterfaces:
+///   - namespace: cosmonic
+///     package: kafka
+///     version: "0.1.0"
+///     interfaces: [producer, consumer]
+///     config:
+///       bootstrap.servers: kafka.svc:9092
+///       group.id: orders-processor
+///       topics: orders,payments        # what this workload may consume
+///     secretFrom:
+///       - kafka-credentials            # sasl.username, sasl.password, ...
+/// ```
+///
+/// Every key is passed to librdkafka verbatim, so any auth mechanism it
+/// supports works unchanged: SASL/PLAIN, SCRAM-SHA-256/512, OAUTHBEARER,
+/// GSSAPI, or mTLS via `ssl.key.pem` / `ssl.certificate.pem`.
+///
+/// The plugin should treat this config as the whole permission grant — a
+/// workload that did not declare a topic should not be able to reach it, even
+/// though the broker-side ACL is the real enforcement point.
+///
+/// ## Why consumption is pull-shaped
+///
+/// A native plugin pushes into workloads through host-side APIs that reach the
+/// workload registry (`call_handle_message`, `deliver_trigger_service_message`).
+/// A component plugin has no such path: its imports resolve against the host's
+/// *native* plugins, never against workloads. So it cannot invoke a
+/// `wasmcloud:messaging/handler`-style export on a workload, and delivery has
+/// to be initiated from the workload side.
+///
+/// `consumer.records()` returns a `stream<consumed-record>` that the plugin
+/// fills as records arrive. The call is ingress, so it is allowed; the stream
+/// then carries records outward without the plugin ever calling in. The cost is
+/// that the consuming workload must be long-lived to hold the stream.
+///
+/// If push delivery to ephemeral components is a requirement, this capability
+/// has to be a native plugin instead.
+@since(version = 0.1.0)
+world host-plugin {
+    /// The capability itself, served across store boundaries to bound
+    /// workloads.
+    @since(version = 0.1.0)
+    export types;
+    @since(version = 0.1.0)
+    export producer;
+    @since(version = 0.1.0)
+    export consumer;
+    @since(version = 0.1.0)
+    export admin;
+
+    /// Per-workload provisioning. `on-workload-bind` receives the interface
+    /// config above and is where this plugin opens that workload's client;
+    /// returning an error there fails the workload's deployment, which is the
+    /// desired behaviour for bad credentials — fail at deploy, not at first
+    /// send.
+    @since(version = 0.1.0)
+    export wasmcloud:host/workload-lifecycle@0.1.1;
+
+    /// Which workload is calling. Required: capability calls carry no binding
+    /// identity, so this is the only way to select that tenant's client.
+    @since(version = 0.1.0)
+    import wasmcloud:host/identity@0.1.1;
+
+    /// Cooperative cancellation, so a long fetch can be unwound instead of
+    /// occupying the plugin instance.
+    @since(version = 0.1.0)
+    import wasmcloud:host/cancel@0.1.1;
+}

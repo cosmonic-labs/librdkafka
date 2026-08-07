@@ -33,3 +33,9 @@ gdbrun*.gdb
 TAGS
 vcpkg_installed
 *tmp-KafkaCluster*
+
+# WIT dependencies are fetched, not vendored.
+# `wash wit fetch` repopulates them from wkg.lock, which IS committed — the
+# lock pins each dependency by digest, so a fetch reproduces the exact tree
+# without carrying thousands of lines of someone else's WIT in this repo.
+wit/deps/

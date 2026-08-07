@@ -1,0 +1,271 @@
+name: WASI
+
+# Builds librdkafka as a WebAssembly component for wasm32-wasip2 and exercises
+# it against a real Kafka broker.
+#
+# Upstream CI runs on Semaphore; this workflow is additive and only covers the
+# WASI port. The native job is here because the cooperative build is a refactor
+# of shared code paths — if it regresses the threaded path, that has to fail
+# here rather than surface on Semaphore later.
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  WASI_SDK_VERSION: "34.0-rc.2"
+  WASI_SDK_TAG: "wasi-sdk-34-rc.2"
+  OPENSSL_VERSION: "3.5.4"
+  WASMTIME_VERSION: "v47.0.3"
+  KAFKA_IMAGE: "apache/kafka:4.1.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the component and prove it is one. Runs without a broker so a
+  # toolchain break is reported separately from a behaviour break.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build component (wasm32-wasip2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wasi-sdk
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_SDK_TAG}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          mkdir -p /opt/wasi-sdk
+          tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+          echo "WASI_SDK=/opt/wasi-sdk" >> "$GITHUB_ENV"
+          /opt/wasi-sdk/bin/clang --version | head -1
+
+      - name: Install wasm-tools
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/bytecodealliance/wasm-tools/releases/latest/download/wasm-tools-installer.sh" -o /tmp/i.sh 2>/dev/null \
+            || cargo install wasm-tools --locked
+          command -v wasm-tools || echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build librdkafka (no TLS)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-wasi \
+            -DCMAKE_TOOLCHAIN_FILE=$WASI_SDK/share/cmake/wasi-sdk-p2.cmake \
+            -DCMAKE_C_FLAGS="-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID" \
+            -DRDKAFKA_BUILD_STATIC=ON -DRDKAFKA_BUILD_EXAMPLES=OFF -DRDKAFKA_BUILD_TESTS=OFF \
+            -DWITH_SSL=OFF -DWITH_SASL=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF \
+            -DWITH_CURL=OFF -DENABLE_LZ4_EXT=OFF -DWITH_LIBDL=OFF -DWITH_PLUGINS=OFF
+          cmake --build build-wasi -j"$(nproc)"
+
+      - name: Assert the archive is really wasm
+        # `rdkafka-sys` silently produces host objects when a cross-build is
+        # misconfigured and only fails much later at link, so check the object
+        # format directly rather than trusting a successful build.
+        run: |
+          set -euo pipefail
+          member=$($WASI_SDK/bin/llvm-ar t build-wasi/src/librdkafka.a | head -1)
+          mkdir -p /tmp/arx && cd /tmp/arx
+          $WASI_SDK/bin/llvm-ar x "$OLDPWD/build-wasi/src/librdkafka.a" "$member"
+          file "$member"
+          file "$member" | grep -q "WebAssembly" \
+            || { echo "::error::librdkafka.a contains non-wasm objects"; exit 1; }
+
+      - name: Link producer test into a component
+        run: |
+          set -euo pipefail
+          # -Wl,-z,stack-size is REQUIRED, not tuning: the cooperative build
+          # nests every librdkafka handler inside the application's own call,
+          # and wasi-sdk's 64 KB default overflows during fetch parsing.
+          $WASI_SDK/bin/clang --target=wasm32-wasip2 \
+            -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
+            -I src -I wasi -Wl,-z,stack-size=8388608 \
+            -o producer_test.wasm wasi/producer_test.c \
+            build-wasi/src/librdkafka.a \
+            -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lm
+
+      - name: Assert it is a component that reaches wasi:sockets
+        run: |
+          set -euo pipefail
+          wasm-tools print producer_test.wasm | head -1 | grep -q '(component' \
+            || { echo "::error::output is a core module, not a component"; exit 1; }
+          echo "--- imports ---"
+          wasm-tools component wit producer_test.wasm | grep -E "import wasi:" | sort -u
+          wasm-tools component wit producer_test.wasm | grep -q "wasi:sockets/tcp" \
+            || { echo "::error::component does not import wasi:sockets/tcp"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librdkafka-wasm32-wasip2
+          path: |
+            build-wasi/src/librdkafka.a
+            producer_test.wasm
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Behaviour against a real broker: producer, consumer groups, SASL, TLS.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test against Kafka (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plaintext, sasl, tls]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wasi-sdk
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_SDK_TAG}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          mkdir -p /opt/wasi-sdk
+          tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+          echo "WASI_SDK=/opt/wasi-sdk" >> "$GITHUB_ENV"
+
+      - name: Install wasmtime
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+            | tar xJ -C /tmp
+          sudo install "/tmp/wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/local/bin/
+          wasmtime --version
+
+      # OpenSSL for wasip2 takes several minutes; cache on the exact toolchain
+      # and version so it is built once per SDK/OpenSSL bump.
+      - name: Cache OpenSSL (wasip2)
+        if: matrix.mode == 'tls'
+        id: ssl-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl-wasi
+          key: openssl-${{ env.OPENSSL_VERSION }}-wasi-${{ env.WASI_SDK_VERSION }}-v1
+
+      - name: Build OpenSSL for wasip2
+        if: matrix.mode == 'tls' && steps.ssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/openssl.tar.gz \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          mkdir -p /tmp/ossl && tar xzf /tmp/openssl.tar.gz -C /tmp/ossl --strip-components=1
+          cd /tmp/ossl
+          # Each disabled feature maps to a primitive WASI genuinely lacks:
+          #   no-secure-memory  mmap/mprotect
+          #   no-ui-console     termios.h and signals
+          #   no-quic           socketpair
+          # OPENSSL_NO_UNIX_SOCK is forced because wasi-libc ships AF_UNIX and
+          # sys/un.h with an incomplete sockaddr_un, so OpenSSL's own autodetect
+          # misses it and bio_addr.c fails on sun_path.
+          CC=$WASI_SDK/bin/clang AR=$WASI_SDK/bin/llvm-ar RANLIB=$WASI_SDK/bin/llvm-ranlib \
+          ./Configure linux-generic32 --target=wasm32-wasip2 \
+            no-asm no-threads no-shared no-dso no-engine no-tests \
+            no-secure-memory no-ui-console no-quic \
+            -DOPENSSL_NO_UNIX_SOCK \
+            -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID
+          make build_generated
+          make -j"$(nproc)" libcrypto.a libssl.a
+          mkdir -p /opt/openssl-wasi
+          cp libcrypto.a libssl.a /opt/openssl-wasi/
+          cp -r include /opt/openssl-wasi/
+
+      - name: Build librdkafka
+        run: |
+          set -euo pipefail
+          SSL_ARGS="-DWITH_SSL=OFF"
+          if [ "${{ matrix.mode }}" = "tls" ]; then
+            SSL_ARGS="-DWITH_SSL=ON -DOPENSSL_ROOT_DIR=/opt/openssl-wasi \
+                      -DOPENSSL_INCLUDE_DIR=/opt/openssl-wasi/include \
+                      -DOPENSSL_CRYPTO_LIBRARY=/opt/openssl-wasi/libcrypto.a \
+                      -DOPENSSL_SSL_LIBRARY=/opt/openssl-wasi/libssl.a"
+          fi
+          cmake -S . -B build-wasi \
+            -DCMAKE_TOOLCHAIN_FILE=$WASI_SDK/share/cmake/wasi-sdk-p2.cmake \
+            -DCMAKE_C_FLAGS="-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID" \
+            -DRDKAFKA_BUILD_STATIC=ON -DRDKAFKA_BUILD_EXAMPLES=OFF -DRDKAFKA_BUILD_TESTS=OFF \
+            $SSL_ARGS \
+            -DWITH_SASL=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_CURL=OFF \
+            -DENABLE_LZ4_EXT=OFF -DWITH_LIBDL=OFF -DWITH_PLUGINS=OFF
+          cmake --build build-wasi -j"$(nproc)"
+
+      - name: Link test components
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ matrix.mode }}" = "tls" ]; then
+            EXTRA="/opt/openssl-wasi/libssl.a /opt/openssl-wasi/libcrypto.a"
+          fi
+          for t in producer consumer; do
+            $WASI_SDK/bin/clang --target=wasm32-wasip2 \
+              -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
+              -I src -I wasi -Wl,-z,stack-size=8388608 \
+              -o ${t}_test.wasm wasi/${t}_test.c \
+              build-wasi/src/librdkafka.a $EXTRA \
+              -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lm
+          done
+
+      - name: Start Kafka
+        run: bash wasi/ci/start-kafka.sh "${{ matrix.mode }}" "${KAFKA_IMAGE}"
+
+      - name: Producer
+        run: bash wasi/ci/run-test.sh producer_test.wasm wasi-producer-topic
+
+      - name: Consumer groups
+        # The group protocol is the part most exposed to cooperative
+        # scheduling — join, rebalance callbacks, heartbeats and commit all
+        # interleave at pump points instead of owning a thread.
+        run: bash wasi/ci/run-test.sh consumer_test.wasm wasi-consumer-topic wasi-ci-${{ matrix.mode }}
+
+      - name: Broker-side verification
+        # Prove the broker actually stored the records rather than trusting the
+        # client's own delivery report. Goes through the container-internal
+        # ADMIN listener, which every mode exposes for exactly this.
+        run: |
+          set -euo pipefail
+          docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server 127.0.0.1:9095 \
+            --topic wasi-producer-topic --from-beginning \
+            --max-messages 1 --timeout-ms 20000
+
+      - name: Broker logs on failure
+        if: failure()
+        run: docker logs kafka 2>&1 | tail -50
+
+  # ---------------------------------------------------------------------------
+  # The WASI port refactors shared code (the thread mains are split into
+  # setup/serve/teardown). This guards the threaded path against that.
+  # ---------------------------------------------------------------------------
+  native-regression:
+    name: Native regression (threaded path)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build native
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev
+          cmake -S . -B build-native \
+            -DRDKAFKA_BUILD_STATIC=ON -DRDKAFKA_BUILD_EXAMPLES=OFF \
+            -DRDKAFKA_BUILD_TESTS=ON -DWITH_SASL=OFF -DWITH_CURL=OFF
+          cmake --build build-native -j"$(nproc)"
+
+      - name: Run librdkafka local test suite
+        # -l restricts to tests that need no broker, so this stays hermetic.
+        run: |
+          set -euo pipefail
+          cd tests
+          TESTS_SKIP_UNSUPPORTED=y RDKAFKA_TEST_CONF=/dev/null TEST_LEVEL=2 \
+            ../build-native/tests/test-runner -l -Q 2>&1 | tee /tmp/suite.log
+          # Count from the results table, not raw log text: broker error strings
+          # such as TOPIC_AUTHORIZATION_FAILED appear inside passing mock tests
+          # and would otherwise be miscounted as failures.
+          failed=$(grep -E "^\|" /tmp/suite.log | grep -c "FAILED" || true)
+          passed=$(grep -E "^\|" /tmp/suite.log | grep -c "PASSED" || true)
+          echo "passed=$passed failed=$failed"
+          [ "$failed" -eq 0 ] || { echo "::error::$failed test(s) failed"; exit 1; }
+          [ "$passed" -gt 0 ] || { echo "::error::no tests ran"; exit 1; }

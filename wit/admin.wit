@@ -1,0 +1,320 @@
+package cosmonic:kafka@0.1.0;
+
+/// Cluster administration: topics, partitions, configuration, groups, ACLs.
+///
+/// Every operation is `async`. librdkafka already runs these asynchronously
+/// over an internal result queue, so this is a closer mapping than a blocking
+/// call with a timeout — the caller composes the wait rather than being handed
+/// a deadline it did not choose.
+@since(version = 0.1.0)
+interface admin {
+    @since(version = 0.1.0)
+    use types.{
+        config-entry, error, topic-partition, partition, offset,
+        uuid, timestamp-ms
+    };
+
+    /// A topic to create.
+    @since(version = 0.1.0)
+    record new-topic {
+        name: string,
+        /// Number of partitions. Use -1 with a broker-side default.
+        num-partitions: s32,
+        /// Replication factor. Use -1 when supplying `replica-assignment`.
+        replication-factor: s32,
+        /// Explicit replica broker ids per partition. When set,
+        /// `num-partitions` and `replication-factor` must both be -1.
+        replica-assignment: list<list<s32>>,
+        /// Topic-level config (`cleanup.policy`, `retention.ms`, ...).
+        config: list<config-entry>,
+    }
+
+    /// Outcome of one entry in a batch admin operation.
+    @since(version = 0.1.0)
+    record operation-result {
+        /// The topic, group or resource the entry referred to.
+        name: string,
+        /// Absent on success.
+        error: option<error>,
+    }
+
+    /// What a configuration entry applies to.
+    @since(version = 0.1.0)
+    enum resource-type {
+        topic,
+        broker,
+        broker-logger,
+        %group,
+    }
+
+    /// Where a configuration value came from. Distinguishes an explicitly set
+    /// value from an inherited default, which matters when deciding whether to
+    /// write it back.
+    @since(version = 0.1.0)
+    enum config-source {
+        unknown,
+        dynamic-topic,
+        dynamic-broker,
+        dynamic-default-broker,
+        static-broker,
+        default-config,
+        dynamic-broker-logger,
+    }
+
+    /// A configuration entry as reported by the broker.
+    @since(version = 0.1.0)
+    record described-config {
+        name: string,
+        value: option<string>,
+        source: config-source,
+        /// Value withheld because it is sensitive (a password, say).
+        is-sensitive: bool,
+        /// Not settable on this resource.
+        is-read-only: bool,
+        /// Value is the inherited default rather than an explicit setting.
+        is-default: bool,
+    }
+
+    /// A partition's replication state.
+    @since(version = 0.1.0)
+    record partition-metadata {
+        id: partition,
+        /// Broker id of the leader, or -1 if there is none right now.
+        leader: s32,
+        replicas: list<s32>,
+        /// Replicas currently in sync. Fewer than `replicas` means the
+        /// partition is under-replicated.
+        isrs: list<s32>,
+        error: option<error>,
+    }
+
+    @since(version = 0.1.0)
+    record topic-metadata {
+        name: string,
+        topic-id: option<uuid>,
+        is-internal: bool,
+        partitions: list<partition-metadata>,
+        error: option<error>,
+    }
+
+    @since(version = 0.1.0)
+    record broker-metadata {
+        id: s32,
+        host: string,
+        port: u16,
+        rack: option<string>,
+    }
+
+    @since(version = 0.1.0)
+    record cluster-metadata {
+        cluster-id: option<string>,
+        /// Broker id of the controller, or -1 if unknown.
+        controller-id: s32,
+        brokers: list<broker-metadata>,
+        topics: list<topic-metadata>,
+    }
+
+    /// Lifecycle state of a consumer group.
+    @since(version = 0.1.0)
+    enum group-state {
+        unknown,
+        preparing-rebalance,
+        completing-rebalance,
+        stable,
+        dead,
+        empty,
+    }
+
+    @since(version = 0.1.0)
+    record group-member {
+        member-id: string,
+        client-id: string,
+        client-host: string,
+        /// Set for a static member (`group.instance.id`).
+        group-instance-id: option<string>,
+        assignment: list<topic-partition>,
+    }
+
+    @since(version = 0.1.0)
+    record consumer-group {
+        group-id: string,
+        state: group-state,
+        /// Protocol the group settled on, e.g. `range`, `roundrobin`,
+        /// `cooperative-sticky`.
+        protocol: string,
+        protocol-type: string,
+        /// Broker id acting as the group's coordinator.
+        coordinator-id: s32,
+        members: list<group-member>,
+        is-simple-consumer-group: bool,
+    }
+
+    /// Which end of a partition `list-offsets` should report.
+    @since(version = 0.1.0)
+    variant offset-spec {
+        /// Earliest retained offset.
+        earliest,
+        /// Next offset to be produced.
+        latest,
+        /// Earliest offset whose timestamp is at or after this value.
+        for-timestamp(timestamp-ms),
+        /// Latest offset readable under `read_committed`.
+        max-timestamp,
+    }
+
+    /// An ACL binding.
+    @since(version = 0.1.0)
+    record acl-binding {
+        resource-type: resource-type,
+        resource-name: string,
+        /// `literal` or `prefixed`.
+        resource-pattern-type: string,
+        principal: string,
+        host: string,
+        /// `read`, `write`, `describe`, `all`, ...
+        operation: string,
+        /// `allow` or `deny`.
+        permission-type: string,
+    }
+
+    @since(version = 0.1.0)
+    resource admin {
+        /// Open an admin client. Same property names as the other clients;
+        /// `bootstrap.servers` is required.
+        @since(version = 0.1.0)
+        open: static async func(config: list<config-entry>)
+            -> result<admin, error>;
+
+        // --- topics -------------------------------------------------------
+
+        /// Create topics. `validate-only` asks the broker to check the request
+        /// without applying it.
+        @since(version = 0.1.0)
+        create-topics: async func(
+            topics: list<new-topic>,
+            validate-only: bool
+        ) -> result<list<operation-result>, error>;
+
+        /// Delete topics. Requires `delete.topic.enable` on the broker.
+        @since(version = 0.1.0)
+        delete-topics: async func(topics: list<string>)
+            -> result<list<operation-result>, error>;
+
+        /// Increase a topic's partition count. Partitions cannot be removed,
+        /// and adding them changes key-to-partition mapping for future
+        /// records — existing records are not moved.
+        @since(version = 0.1.0)
+        create-partitions: async func(
+            topic-partition-counts: list<tuple<string, u32>>,
+            validate-only: bool
+        ) -> result<list<operation-result>, error>;
+
+        /// Describe topics by name.
+        @since(version = 0.1.0)
+        describe-topics: async func(topics: list<string>)
+            -> result<list<topic-metadata>, error>;
+
+        /// Delete every record before the given offset in each partition.
+        @since(version = 0.1.0)
+        delete-records: async func(
+            offsets: list<topic-partition>
+        ) -> result<list<topic-partition>, error>;
+
+        // --- configuration ------------------------------------------------
+
+        @since(version = 0.1.0)
+        describe-config: async func(
+            %resource: resource-type,
+            name: string
+        ) -> result<list<described-config>, error>;
+
+        /// Replace a resource's whole dynamic configuration. Any property not
+        /// listed reverts to its default — prefer `incremental-alter-config`
+        /// unless a full replace is what you mean.
+        @since(version = 0.1.0)
+        alter-config: async func(
+            %resource: resource-type,
+            name: string,
+            config: list<config-entry>
+        ) -> result<_, error>;
+
+        /// Change individual properties, leaving the rest untouched.
+        /// `operation` is `set`, `delete`, `append` or `subtract`.
+        @since(version = 0.1.0)
+        incremental-alter-config: async func(
+            %resource: resource-type,
+            name: string,
+            changes: list<tuple<string, string, string>>
+        ) -> result<_, error>;
+
+        // --- cluster ------------------------------------------------------
+
+        /// Cluster metadata. `topics` empty means every topic.
+        @since(version = 0.1.0)
+        describe-cluster: async func(topics: list<string>)
+            -> result<cluster-metadata, error>;
+
+        /// Offsets matching a spec, per partition.
+        @since(version = 0.1.0)
+        list-offsets: async func(
+            partitions: list<topic-partition>,
+            spec: offset-spec
+        ) -> result<list<topic-partition>, error>;
+
+        // --- consumer groups ----------------------------------------------
+
+        /// List groups, optionally filtered by state.
+        @since(version = 0.1.0)
+        list-consumer-groups: async func(
+            states: list<group-state>
+        ) -> result<list<consumer-group>, error>;
+
+        /// Describe groups, including membership and assignment.
+        @since(version = 0.1.0)
+        describe-consumer-groups: async func(groups: list<string>)
+            -> result<list<consumer-group>, error>;
+
+        /// Delete groups. A group must be empty first.
+        @since(version = 0.1.0)
+        delete-consumer-groups: async func(groups: list<string>)
+            -> result<list<operation-result>, error>;
+
+        /// A group's committed offsets. Empty `partitions` means all of them.
+        @since(version = 0.1.0)
+        list-consumer-group-offsets: async func(
+            group-id: string,
+            partitions: list<topic-partition>
+        ) -> result<list<topic-partition>, error>;
+
+        /// Overwrite a group's committed offsets. The group must have no
+        /// active members, or the brokers reject it.
+        @since(version = 0.1.0)
+        alter-consumer-group-offsets: async func(
+            group-id: string,
+            offsets: list<topic-partition>
+        ) -> result<list<topic-partition>, error>;
+
+        /// Delete a group's committed offsets for these partitions.
+        @since(version = 0.1.0)
+        delete-consumer-group-offsets: async func(
+            group-id: string,
+            partitions: list<topic-partition>
+        ) -> result<list<topic-partition>, error>;
+
+        // --- access control -----------------------------------------------
+
+        @since(version = 0.1.0)
+        create-acls: async func(bindings: list<acl-binding>)
+            -> result<list<operation-result>, error>;
+
+        /// Find ACLs matching a filter. Empty string fields match anything.
+        @since(version = 0.1.0)
+        describe-acls: async func(%filter: acl-binding)
+            -> result<list<acl-binding>, error>;
+
+        /// Delete ACLs matching the filters. Returns what was removed.
+        @since(version = 0.1.0)
+        delete-acls: async func(filters: list<acl-binding>)
+            -> result<list<acl-binding>, error>;
+    }
+}
