@@ -697,6 +697,18 @@ struct rd_kafka_s {
         rd_kafka_timer_t metadata_refresh_tmr;
         /** 1s interval timer */
         rd_kafka_timer_t one_s_tmr;
+#ifdef __wasi__
+        /** Stats-emit timer for the main handler.
+         *
+         *  On threaded builds this lives on the main thread's stack, which
+         *  spans the whole loop. A cooperative task returns between passes, so
+         *  it has to be carried here instead. */
+        rd_kafka_timer_t rk_wasm_tmr_stats_emit;
+        /** Whether the main handler's one-time setup has run. */
+        int rk_wasm_main_started;
+        /** Whether the background handler's one-time setup has run. */
+        int rk_wasm_bg_started;
+#endif
         /** Rebootstrap timer.
          *  Will add bootstrap brokers again
          *  when it's fired. */

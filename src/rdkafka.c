@@ -41,6 +41,9 @@
 #endif
 
 #include "rdkafka_int.h"
+#ifdef __wasi__
+#include "rdwasm.h"
+#endif
 #include "rdkafka_msg.h"
 #include "rdkafka_broker.h"
 #include "rdkafka_topic.h"
@@ -1149,7 +1152,7 @@ void rd_kafka_destroy_final(rd_kafka_t *rk) {
 
 static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
         thrd_t thrd;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         int term_sig = rk->rk_conf.term_sig;
 #endif
         int res;
@@ -1198,8 +1201,19 @@ static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
         /* Make sure destroy is not called from a librdkafka thread
          * since this will most likely cause a deadlock.
          * FIXME: include broker threads (for log_cb) */
+#ifdef __wasi__
+        /* Not checkable, and not the hazard it guards against. The deadlock
+         * this prevents is a handler thread waiting on itself; a cooperative
+         * build has exactly one thread that the application and every handler
+         * share, so thrd_is_current() is unconditionally true here and the
+         * check would reject every legitimate destroy. Termination is driven by
+         * the scheduler instead — the handlers observe rk_terminate on their
+         * next slice and retire. */
+        if (0) {
+#else
         if (thrd_is_current(rk->rk_thread) ||
             thrd_is_current(rk->rk_background.thread)) {
+#endif
                 rd_kafka_log(rk, LOG_EMERG, "BGQUEUE",
                              "Application bug: "
                              "rd_kafka_destroy() called from "
@@ -1263,7 +1277,7 @@ static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
          * The op itself is (likely) ignored by the receiver. */
         rd_kafka_q_enq(rk->rk_ops, rd_kafka_op_new(RD_KAFKA_OP_TERMINATE));
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Interrupt main kafka thread to speed up termination. */
         if (term_sig) {
                 rd_kafka_dbg(rk, GENERIC, "TERMINATE",
@@ -1277,11 +1291,20 @@ static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
 
         rd_kafka_dbg(rk, GENERIC, "TERMINATE", "Joining internal main thread");
 
+#ifdef __wasi__
+        /* Drive this client's cooperative tasks to completion before the
+         * handle is freed below. A task is a function pointer plus a pointer
+         * into `rk`, so one surviving the handle is a use-after-free the next
+         * time anything pumps — and with a second client in the same process
+         * that is its very next call. */
+        rd_wasm_join_owner(rk);
+#else
         if (thrd_join(thrd, &res) != thrd_success)
                 rd_kafka_log(rk, LOG_ERR, "DESTROY",
                              "Failed to join internal main thread: %s "
                              "(was process forked?)",
                              rd_strerror(errno));
+#endif
 
         rd_kafka_destroy_final(rk);
 }
@@ -2383,10 +2406,16 @@ static void rd_kafka_share_log_fetch_stall(rd_kafka_t *rk, const char *reason) {
 /**
  * Main loop for Kafka handler thread.
  */
-static int rd_kafka_thread_main(void *arg) {
-        rd_kafka_t *rk                  = arg;
-        rd_kafka_timer_t tmr_stats_emit = RD_ZERO_INIT;
-
+/**
+ * @brief One-time setup for the main handler.
+ *
+ * Split out of rd_kafka_thread_main() so a cooperative (thread-less) build can
+ * run it once and then drive rd_kafka_thread_main_serve() itself. The threaded
+ * path calls these in exactly the original order, so its behaviour is
+ * unchanged.
+ */
+static void rd_kafka_thread_main_setup(rd_kafka_t *rk,
+                                       rd_kafka_timer_t *tmr_stats_emit) {
         rd_kafka_set_thread_name("main");
         rd_kafka_set_thread_sysname("rdk:main");
         rd_kafka_thread_srand(rk, rd_true /* we're in an internal thread */);
@@ -2404,7 +2433,7 @@ static int rd_kafka_thread_main(void *arg) {
         rd_kafka_timer_start(&rk->rk_timers, &rk->one_s_tmr, 1000000,
                              rd_kafka_1s_tmr_cb, NULL);
         if (rk->rk_conf.stats_interval_ms)
-                rd_kafka_timer_start(&rk->rk_timers, &tmr_stats_emit,
+                rd_kafka_timer_start(&rk->rk_timers, tmr_stats_emit,
                                      rk->rk_conf.stats_interval_ms * 1000ll,
                                      rd_kafka_stats_emit_tmr_cb, NULL);
         if (rk->rk_conf.metadata_refresh_interval_ms > 0)
@@ -2424,14 +2453,33 @@ static int rd_kafka_thread_main(void *arg) {
         cnd_broadcast(&rk->rk_init_cnd);
         mtx_unlock(&rk->rk_init_lock);
 
-        while (likely(!rd_kafka_terminating(rk) || rd_kafka_q_len(rk->rk_ops) ||
+}
+
+/**
+ * @returns non-zero while the main handler still has work to do.
+ */
+static int rd_kafka_thread_main_running(rd_kafka_t *rk) {
+        return likely(!rd_kafka_terminating(rk) || rd_kafka_q_len(rk->rk_ops) ||
                       (rk->rk_cgrp && (rk->rk_cgrp->rkcg_state !=
-                                       RD_KAFKA_CGRP_STATE_TERM)))) {
+                                       RD_KAFKA_CGRP_STATE_TERM)));
+}
+
+/**
+ * @brief One pass of the main handler loop.
+ */
+static void rd_kafka_thread_main_serve(rd_kafka_t *rk) {
+        {
                 rd_ts_t sleeptime = rd_kafka_timers_next(
                     &rk->rk_timers, 1000 * 1000 /*1s*/, 1 /*lock*/);
                 /* Use ceiling division to avoid calling serve with a 0 ms
                  * timeout in a tight loop until 1 ms has passed. */
                 int timeout_ms = (sleeptime + 999) / 1000;
+#ifdef __wasi__
+                /* Cooperative build: this pass must not block, or it would
+                 * stall every other task (including the brokers this handler
+                 * is waiting on). The scheduler supplies the pacing instead. */
+                timeout_ms = RD_POLL_NOWAIT;
+#endif
                 rd_kafka_q_serve(rk->rk_ops, timeout_ms, 0,
                                  RD_KAFKA_Q_CB_CALLBACK, NULL, NULL);
                 if (rk->rk_cgrp) /* FIXME: move to timer-triggered */
@@ -2478,7 +2526,13 @@ static int rd_kafka_thread_main(void *arg) {
 
                 rd_kafka_timers_run(&rk->rk_timers, RD_POLL_NOWAIT);
         }
+}
 
+/**
+ * @brief Teardown for the main handler, run once the loop condition goes false.
+ */
+static void rd_kafka_thread_main_teardown(rd_kafka_t *rk,
+                                          rd_kafka_timer_t *tmr_stats_emit) {
         rd_kafka_dbg(rk, GENERIC, "TERMINATE",
                      "Internal main thread terminating");
 
@@ -2490,7 +2544,7 @@ static int rd_kafka_thread_main(void *arg) {
 
         rd_kafka_timer_stop(&rk->rk_timers, &rk->one_s_tmr, 1);
         if (rk->rk_conf.stats_interval_ms)
-                rd_kafka_timer_stop(&rk->rk_timers, &tmr_stats_emit, 1);
+                rd_kafka_timer_stop(&rk->rk_timers, tmr_stats_emit, 1);
         rd_kafka_timer_stop(&rk->rk_timers, &rk->metadata_refresh_tmr, 1);
 
         /* Synchronise state */
@@ -2505,9 +2559,60 @@ static int rd_kafka_thread_main(void *arg) {
                      "Internal main thread termination done");
 
         rd_atomic32_sub(&rd_kafka_thread_cnt_curr, 1);
+}
+
+static int rd_kafka_thread_main(void *arg) {
+        rd_kafka_t *rk                  = arg;
+        rd_kafka_timer_t tmr_stats_emit = RD_ZERO_INIT;
+
+        rd_kafka_thread_main_setup(rk, &tmr_stats_emit);
+
+        while (rd_kafka_thread_main_running(rk))
+                rd_kafka_thread_main_serve(rk);
+
+        rd_kafka_thread_main_teardown(rk, &tmr_stats_emit);
 
         return 0;
 }
+
+#ifdef __wasi__
+/**
+ * @brief One cooperative slice of the main handler.
+ * @returns non-zero once the handler has run to completion.
+ */
+static int rd_kafka_thread_main_step(void *arg) {
+        rd_kafka_t *rk = arg;
+
+        /* Setup runs on the first slice rather than at registration time.
+         * rd_kafka_new() registers this task while holding rk_init_lock and
+         * the write lock, and the setup takes rk_init_lock to decrement
+         * rk_init_wait_cnt — running it inline would deadlock against its own
+         * caller. Deferring mirrors the threaded ordering exactly: a real
+         * handler thread also cannot get past its rd_kafka_wrlock() until the
+         * creator has released. */
+        if (!rk->rk_wasm_main_started) {
+                rk->rk_wasm_main_started = 1;
+                rd_kafka_thread_main_setup(rk, &rk->rk_wasm_tmr_stats_emit);
+        }
+
+        if (!rd_kafka_thread_main_running(rk)) {
+                rd_kafka_thread_main_teardown(rk, &rk->rk_wasm_tmr_stats_emit);
+                return 1;
+        }
+
+        rd_kafka_thread_main_serve(rk);
+
+        return 0;
+}
+
+/**
+ * @brief Cooperative stand-in for spawning the main handler thread.
+ * @returns 0 on success, -1 if the task table is full.
+ */
+static int rd_kafka_thread_main_task_start(rd_kafka_t *rk) {
+        return rd_wasm_task_add(rd_kafka_thread_main_step, rk, rk);
+}
+#endif
 
 
 void rd_kafka_term_sig_handler(int sig) {
@@ -2525,7 +2630,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
         rd_kafka_resp_err_t ret_err = RD_KAFKA_RESP_ERR_NO_ERROR;
         int ret_errno               = 0;
         const char *conf_err;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         sigset_t newset, oldset;
 #endif
         char builtin_features[128];
@@ -2911,7 +3016,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
                     rd_kafkap_str_new(rk->rk_conf.eos.transactional_id, -1);
         }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Block all signals in newly created threads.
          * To avoid race condition we block all signals in the calling
          * thread, which the new thread will inherit its sigmask from,
@@ -2951,8 +3056,12 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
         /* Create handler thread */
         mtx_lock(&rk->rk_init_lock);
         rk->rk_init_wait_cnt++;
+#ifdef __wasi__
+        if (rd_kafka_thread_main_task_start(rk) != 0) {
+#else
         if ((thrd_create(&rk->rk_thread, rd_kafka_thread_main, rk)) !=
             thrd_success) {
+#endif
                 rk->rk_init_wait_cnt--;
                 ret_err   = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
                 ret_errno = errno;
@@ -2962,7 +3071,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
                                     rd_strerror(errno), errno);
                 mtx_unlock(&rk->rk_init_lock);
                 rd_kafka_wrunlock(rk);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
                 /* Restore sigmask of caller */
                 pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -2990,7 +3099,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
                                         "No brokers configured");
         }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Restore sigmask of caller */
         pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif

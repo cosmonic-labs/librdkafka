@@ -27,6 +27,10 @@ freely, subject to the following restrictions:
 
 #if !WITH_C11THREADS
 
+#ifdef __wasi__
+  #include "rdwasm.h"
+#endif
+
 /* Platform specific includes */
 #if defined(_TTHREAD_POSIX_)
   #include <signal.h>
@@ -438,6 +442,22 @@ int cnd_wait(cnd_t *cond, mtx_t *mtx)
 {
 #if defined(_TTHREAD_WIN32_)
   return _cnd_timedwait_win32(cond, mtx, INFINITE);
+#elif defined(__wasi__)
+  /* Nothing else runs concurrently to signal this condition, so blocking here
+   * would deadlock outright. Advance every cooperative task once and report a
+   * spurious wakeup: every librdkafka caller re-tests its predicate in a loop,
+   * so this turns each wait site into a scheduler pump point.
+   *
+   * The mutex is dropped across the pump exactly as a real condition variable
+   * does. Without that, a task woken here would deadlock the moment it touched
+   * the same lock its waiter is holding — which is precisely what rd_kafka_new()
+   * does, waiting on rk_init_lock for a handler that must take rk_init_lock to
+   * report itself started. */
+  (void)cond;
+  mtx_unlock(mtx);
+  rd_wasm_pump();
+  mtx_lock(mtx);
+  return thrd_success;
 #else
   return pthread_cond_wait(cond, mtx) == 0 ? thrd_success : thrd_error;
 #endif
@@ -457,6 +477,32 @@ int cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
   }
   else
     return thrd_error;
+#elif defined(__wasi__)
+  /* Pump the cooperative tasks, then honour the caller's deadline.
+   *
+   * Reporting the timeout accurately matters as much as making progress:
+   * rd_kafka_new()'s init handshake loops for as long as this returns
+   * thrd_success, so a shim that always claimed a wakeup would spin forever
+   * whenever initialisation genuinely fails. */
+  {
+    struct timespec now;
+    (void)cond;
+
+    /* Drop the mutex across the pump, as a real condition variable does —
+     * see cnd_wait() above for why this is load-bearing. */
+    mtx_unlock(mtx);
+    rd_wasm_pump();
+    mtx_lock(mtx);
+
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0)
+      return thrd_error;
+
+    if (now.tv_sec > ts->tv_sec ||
+        (now.tv_sec == ts->tv_sec && now.tv_nsec >= ts->tv_nsec))
+      return thrd_timedout;
+
+    return thrd_success;
+  }
 #else
   int ret;
   ret = pthread_cond_timedwait(cond, mtx, ts);
@@ -661,6 +707,11 @@ void thrd_exit(int res)
   }
 
   ExitThread(res);
+#elif defined(__wasi__)
+  /* No threads to exit from: a task returns to the cooperative scheduler
+   * rather than unwinding a thread. Placeholder until the scheduler lands —
+   * reaching here means a task tried to exit out of band. */
+  (void)res;
 #else
   pthread_exit((void*)(intptr_t)res);
 #endif
@@ -668,7 +719,21 @@ void thrd_exit(int res)
 
 int thrd_join(thrd_t thr, int *res)
 {
-#if defined(_TTHREAD_WIN32_)
+#if defined(__wasi__)
+  /* Nothing to join. A cooperative task retires itself by returning non-zero
+   * from its step, and every join site in librdkafka runs after the target has
+   * already been asked to terminate — the broker decommission path joins from
+   * an op callback that the target's own teardown enqueued, so by the time it
+   * runs the task is gone.
+   *
+   * Draining "until no tasks remain" would be wrong, not merely slow: the
+   * joiner is typically one of the surviving tasks (the main handler), so
+   * waiting for the table to empty waits on itself and never returns. */
+  (void)thr;
+  if (res != NULL)
+    *res = 0;
+  return thrd_success;
+#elif defined(_TTHREAD_WIN32_)
   DWORD dwRes;
 
   if (WaitForSingleObject(thr, INFINITE) == WAIT_FAILED)

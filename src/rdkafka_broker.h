@@ -318,6 +318,12 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 
         thrd_t rkb_thread;
 
+#ifdef __wasi__
+        /** Whether this broker handler's one-time setup has run.
+         *  Cooperative builds defer setup to the first scheduled slice. */
+        int rkb_wasm_started;
+#endif
+
         rd_refcnt_t rkb_refcnt;
 
         rd_kafka_t *rkb_rk;

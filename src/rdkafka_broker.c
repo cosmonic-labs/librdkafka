@@ -52,6 +52,9 @@
 #include "rd.h"
 #include "rdaddr.h"
 #include "rdkafka_int.h"
+#ifdef __wasi__
+#include "rdwasm.h"
+#endif
 #include "rdkafka_msg.h"
 #include "rdkafka_msgset.h"
 #include "rdkafka_topic.h"
@@ -80,7 +83,15 @@
 #include "rdunittest.h"
 
 
+#ifdef __wasi__
+/* Cooperative build: a broker slice must return promptly so the other tasks —
+ * including the main handler that feeds it work — get to run. Blocking here for
+ * a second would serialise the whole client on one broker. The scheduler
+ * provides the pacing that this timeout provides on threaded builds. */
+static const int rd_kafka_max_block_ms = 0;
+#else
 static const int rd_kafka_max_block_ms = 1000;
+#endif
 
 const char *rd_kafka_broker_state_names[] = {
     "INIT",           "DOWN",        "TRY_CONNECT", "CONNECT",
@@ -4847,10 +4858,15 @@ rd_kafka_broker_addresses_exhausted(const rd_kafka_broker_t *rkb) {
 }
 
 
-static int rd_kafka_broker_thread_main(void *arg) {
-        rd_kafka_broker_t *rkb = arg;
-        rd_kafka_t *rk         = rkb->rkb_rk;
-        rd_kafka_op_t *terminate_op;
+/**
+ * @brief One-time setup for a broker handler.
+ *
+ * Split out of rd_kafka_broker_thread_main() so a cooperative (thread-less)
+ * build can drive the loop body itself. The threaded path calls the pieces in
+ * the original order, so its behaviour is unchanged.
+ */
+static void rd_kafka_broker_thread_main_setup(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
 
         rd_kafka_set_thread_name("%s", rkb->rkb_name);
         rd_kafka_set_thread_sysname("rdk:broker%" PRId32, rkb->rkb_nodeid);
@@ -4870,8 +4886,17 @@ static int rd_kafka_broker_thread_main(void *arg) {
         rd_kafka_broker_unlock(rkb);
 
         rd_rkb_dbg(rkb, BROKER, "BRKMAIN", "Enter main broker thread");
+}
 
-        while (!rd_kafka_broker_terminating(rkb)) {
+/**
+ * @brief One pass of the broker handler loop.
+ *
+ * Returning from this function is exactly what `continue` did inside the
+ * original while loop: end this iteration and re-test the loop condition.
+ */
+static void rd_kafka_broker_thread_main_serve(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
+        {
                 int backoff;
                 int r;
                 rd_kafka_broker_state_t orig_state;
@@ -4930,7 +4955,7 @@ static int rd_kafka_broker_thread_main(void *arg) {
                                                       rd_kafka_max_block_ms);
                                 /* Continue while loop to try again (as long as
                                  * we are not terminating). */
-                                continue;
+                                return;
                         }
 
                         /* Throttle & jitter reconnects to avoid
@@ -4943,7 +4968,7 @@ static int rd_kafka_broker_thread_main(void *arg) {
                                            "Delaying next reconnect by %dms",
                                            backoff);
                                 rd_kafka_broker_serve(rkb, (int)backoff);
-                                continue;
+                                return;
                         }
 
                         /* Initiate asynchronous connection attempt.
@@ -5057,6 +5082,22 @@ static int rd_kafka_broker_thread_main(void *arg) {
                             (int)rd_kafka_bufq_cnt(&rkb->rkb_retrybufs), r);
                 }
         }
+}
+
+/**
+ * @brief Teardown for a broker handler, run once the loop condition goes false.
+ */
+static void rd_kafka_broker_thread_main_teardown(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_op_t *terminate_op;
+
+#ifdef __wasi__
+        /* Retire this broker's task before the teardown drops the last
+         * reference. The step that called us returns non-zero and would clear
+         * the slot anyway, but the teardown enqueues an op whose callback may
+         * destroy the broker first, so the slot must not still point at it. */
+        rd_wasm_task_remove(rkb);
+#endif
 
         /* Disable and drain ops queue.
          * Simply purging the ops queue risks leaving dangling references
@@ -5121,9 +5162,56 @@ static int rd_kafka_broker_thread_main(void *arg) {
 
         /* Release broker thread reference here and call destroy final. */
         rd_kafka_broker_destroy(rkb);
+}
+
+static int rd_kafka_broker_thread_main(void *arg) {
+        rd_kafka_broker_t *rkb = arg;
+
+        rd_kafka_broker_thread_main_setup(rkb);
+
+        while (!rd_kafka_broker_terminating(rkb))
+                rd_kafka_broker_thread_main_serve(rkb);
+
+        rd_kafka_broker_thread_main_teardown(rkb);
 
         return 0;
 }
+
+#ifdef __wasi__
+/**
+ * @brief One cooperative slice of a broker handler.
+ * @returns non-zero once the handler has run to completion.
+ */
+static int rd_kafka_broker_thread_main_step(void *arg) {
+        rd_kafka_broker_t *rkb = arg;
+
+        /* Deferred for the same reason as the main handler: rd_kafka_broker_add
+         * registers this task while holding the broker lock, and the setup
+         * takes that same lock to synchronise state. */
+        if (!rkb->rkb_wasm_started) {
+                rkb->rkb_wasm_started = 1;
+                rd_kafka_broker_thread_main_setup(rkb);
+        }
+
+        if (rd_kafka_broker_terminating(rkb)) {
+                rd_kafka_broker_thread_main_teardown(rkb);
+                return 1;
+        }
+
+        rd_kafka_broker_thread_main_serve(rkb);
+
+        return 0;
+}
+
+/**
+ * @brief Cooperative stand-in for spawning a broker handler thread.
+ * @returns 0 on success, -1 if the task table is full.
+ */
+static int rd_kafka_broker_thread_task_start(rd_kafka_broker_t *rkb) {
+        return rd_wasm_task_add(rd_kafka_broker_thread_main_step, rkb,
+                                rkb->rkb_rk);
+}
+#endif
 
 
 /**
@@ -5256,7 +5344,7 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
                                        uint16_t port,
                                        int32_t nodeid) {
         rd_kafka_broker_t *rkb;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         int r;
         sigset_t newset, oldset;
 #endif
@@ -5390,7 +5478,7 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
         rd_interval_init(&rkb->rkb_suppress.unsupported_kip62);
         rd_interval_init(&rkb->rkb_suppress.fail_error);
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Block all signals in newly created thread.
          * To avoid race condition we block all signals in the calling
          * thread, which the new thread will inherit its sigmask from,
@@ -5414,7 +5502,7 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
         rkb->rkb_wakeup_fd[0] = -1;
         rkb->rkb_wakeup_fd[1] = -1;
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         if ((r = rd_pipe_nonblocking(rkb->rkb_wakeup_fd)) == -1) {
                 rd_rkb_log(rkb, LOG_ERR, "WAKEUPFD",
                            "Failed to setup broker queue wake-up fds: "
@@ -5438,8 +5526,12 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
          * the broker thread until we've finalized the rkb. */
         rd_kafka_broker_lock(rkb);
         rd_kafka_broker_keep(rkb); /* broker thread's refcnt */
+#ifdef __wasi__
+        if (rd_kafka_broker_thread_task_start(rkb) != 0) {
+#else
         if (thrd_create(&rkb->rkb_thread, rd_kafka_broker_thread_main, rkb) !=
             thrd_success) {
+#endif
                 rd_kafka_broker_unlock(rkb);
 
                 rd_kafka_log(rk, LOG_CRIT, "THREAD",
@@ -5451,7 +5543,7 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
 
                 rd_free(rkb);
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
                 /* Restore sigmask of caller */
                 pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -5498,7 +5590,7 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
                                     rd_kafka_coord_rkb_monitor_cb);
 
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Restore sigmask of caller */
         pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -6597,7 +6689,7 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
         rd_kafka_dbg(rk, BROKER, "DESTROY", "Sending TERMINATE to %s",
                      rd_kafka_broker_name(rkb));
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Interrupt IO threads to speed up termination. */
         if (rk->rk_conf.term_sig)
                 pthread_kill(rkb->rkb_thread, rk->rk_conf.term_sig);

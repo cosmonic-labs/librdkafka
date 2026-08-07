@@ -52,7 +52,14 @@ int thrd_setname(const char *name) {
 }
 
 int thrd_is_current(thrd_t thr) {
-#if defined(_TTHREAD_WIN32_)
+#if defined(__wasi__)
+        /* Single-threaded cooperative build: every handler runs on the one and
+         * only thread, so the locality assertions this backs are trivially
+         * satisfied. The stored thrd_t is never populated (no thread was ever
+         * created), so comparing against it would fail spuriously. */
+        (void)thr;
+        return 1;
+#elif defined(_TTHREAD_WIN32_)
         return GetThreadId(thr) == GetCurrentThreadId();
 #else
         return (pthread_self() == thr);

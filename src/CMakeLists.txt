@@ -78,6 +78,7 @@ set(
     rdvarint.c
     rdmap.c
     snappy.c
+    rdwasm.c
     tinycthread.c
     tinycthread_extra.c
     rdxxhash.c

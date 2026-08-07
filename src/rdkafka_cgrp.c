@@ -6463,7 +6463,15 @@ void rd_kafka_cgrp_terminate0(rd_kafka_cgrp_t *rkcg, rd_kafka_op_t *rko) {
  * Locality: any thread
  */
 void rd_kafka_cgrp_terminate(rd_kafka_cgrp_t *rkcg, rd_kafka_replyq_t replyq) {
+#ifndef __wasi__
+        /* Not checkable on a cooperative build: the application and every
+         * handler share the one thread, so thrd_is_current() is always true
+         * and this would reject every legitimate consumer_close(). The
+         * assertion guards against enqueueing terminate from the main handler
+         * and then waiting on that same handler to drain it; here the wait
+         * itself pumps the scheduler, so the handler still runs. */
         rd_kafka_assert(NULL, !thrd_is_current(rkcg->rkcg_rk->rk_thread));
+#endif
         if (RD_KAFKA_IS_SHARE_CONSUMER(rkcg->rkcg_rk)) {
                 rd_list_t *ack_batches =
                     rd_kafka_share_build_ack_details(rkcg->rkcg_rk->rk_rkshare);

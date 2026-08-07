@@ -318,6 +318,26 @@ void rd_kafka_timers_run(rd_kafka_timers_t *rkts, int timeout_us) {
         rd_ts_t now = rd_clock();
         rd_ts_t end = now + timeout_us;
 
+#ifdef __wasi__
+        /* Re-entrancy guard for the cooperative build.
+         *
+         * This function waits on rkts_cond while holding rkts_lock, and on a
+         * single-threaded build that wait is a scheduler pump point — so the
+         * main handler runs and calls back into this same timer wheel. Two
+         * interleaved iterations of one TAILQ corrupt it (the inner run
+         * unschedules entries the outer is walking).
+         *
+         * A real mutex makes this impossible by blocking the second entrant;
+         * with one thread there is nothing to block, so refuse explicitly.
+         * Skipping is safe rather than merely convenient: the outer invocation
+         * is already iterating and will fire whatever comes due. */
+        static int rd_wasm_timers_running;
+
+        if (rd_wasm_timers_running)
+                return;
+        rd_wasm_timers_running = 1;
+#endif
+
         rd_kafka_timers_lock(rkts);
 
         while (!rd_kafka_terminating(rkts->rkts_rk) && now <= end) {
@@ -377,6 +397,10 @@ void rd_kafka_timers_run(rd_kafka_timers_t *rkts, int timeout_us) {
         }
 
         rd_kafka_timers_unlock(rkts);
+
+#ifdef __wasi__
+        rd_wasm_timers_running = 0;
+#endif
 }
 
 

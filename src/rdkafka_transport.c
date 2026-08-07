@@ -119,7 +119,7 @@ void rd_kafka_transport_shutdown(rd_kafka_transport_t *rktrans) {
 }
 
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
 /**
  * @brief sendmsg() abstraction, converting a list of segments to iovecs.
  * @remark should only be called if the number of segments is > 1.
@@ -237,7 +237,7 @@ static ssize_t rd_kafka_transport_socket_send(rd_kafka_transport_t *rktrans,
                                               rd_slice_t *slice,
                                               char *errstr,
                                               size_t errstr_size) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* FIXME: Use sendmsg() with iovecs if there's more than one segment
          * remaining, otherwise (or if platform does not have sendmsg)
          * use plain send(). */
@@ -250,7 +250,7 @@ static ssize_t rd_kafka_transport_socket_send(rd_kafka_transport_t *rktrans,
 
 
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
 /**
  * @brief recvmsg() abstraction, converting a list of segments to iovecs.
  * @remark should only be called if the number of segments is > 1.
@@ -366,7 +366,7 @@ static ssize_t rd_kafka_transport_socket_recv(rd_kafka_transport_t *rktrans,
                                               rd_buf_t *buf,
                                               char *errstr,
                                               size_t errstr_size) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         return rd_kafka_transport_socket_recvmsg(rktrans, buf, errstr,
                                                  errstr_size);
 #endif

@@ -538,6 +538,16 @@ rd_file_mkstemp(const char *prefix,
                 return NULL; /* Failed to create temp file name */
 
         tempfile = fopen(tempfile_path, mode);
+#elif defined(__wasi__)
+        /* WASI has no mkstemp(3) and no ambient /tmp: a component only sees
+         * the preopens it was granted. Report the same failure the other
+         * branches use when a temp file cannot be created, rather than
+         * inventing a path the sandbox may not be able to open. */
+        char tempfile_path[1] = "";
+        (void)prefix;
+        (void)mode;
+        (void)tempfile_path;
+        return NULL;
 #else
         int tempfile_fd;
         char tempfile_path[512];

@@ -34,6 +34,9 @@
 
 #include "rd.h"
 #include "rdkafka_int.h"
+#ifdef __wasi__
+#include "rdwasm.h"
+#endif
 #include "rdkafka_event.h"
 #include "rdkafka_interceptor.h"
 
@@ -106,9 +109,11 @@ rd_kafka_background_queue_serve(rd_kafka_t *rk,
 /**
  * @brief Main loop for background queue thread.
  */
-int rd_kafka_background_thread_main(void *arg) {
-        rd_kafka_t *rk = arg;
-
+/**
+ * @brief One-time setup for the background handler. Split out so a cooperative
+ *        (thread-less) build can drive the loop body itself.
+ */
+static void rd_kafka_background_thread_setup(rd_kafka_t *rk) {
         rd_kafka_set_thread_name("background");
         rd_kafka_set_thread_sysname("rdk:bg");
         rd_kafka_thread_srand(rk, rd_true /* we're in an internal thread */);
@@ -127,12 +132,27 @@ int rd_kafka_background_thread_main(void *arg) {
         cnd_broadcast(&rk->rk_init_cnd);
         mtx_unlock(&rk->rk_init_lock);
 
-        while (likely(!rd_kafka_terminating(rk))) {
-                rd_kafka_q_serve(rk->rk_background.q, 10 * 1000, 0,
-                                 RD_KAFKA_Q_CB_RETURN,
-                                 rd_kafka_background_queue_serve, NULL);
-        }
+}
 
+/**
+ * @brief One pass of the background handler loop.
+ */
+static void rd_kafka_background_thread_serve(rd_kafka_t *rk) {
+#ifdef __wasi__
+        /* Must not block: the 10s timeout below would stall every other task. */
+        rd_kafka_q_serve(rk->rk_background.q, RD_POLL_NOWAIT, 0,
+                         RD_KAFKA_Q_CB_RETURN, rd_kafka_background_queue_serve,
+                         NULL);
+#else
+        rd_kafka_q_serve(rk->rk_background.q, 10 * 1000, 0, RD_KAFKA_Q_CB_RETURN,
+                         rd_kafka_background_queue_serve, NULL);
+#endif
+}
+
+/**
+ * @brief Teardown for the background handler.
+ */
+static void rd_kafka_background_thread_teardown(rd_kafka_t *rk) {
         /* Inform the user that they terminated the client before
          * all outstanding events were handled. */
         if (rd_kafka_q_len(rk->rk_background.q) > 0)
@@ -147,9 +167,46 @@ int rd_kafka_background_thread_main(void *arg) {
         rd_kafka_interceptors_on_thread_exit(rk, RD_KAFKA_THREAD_BACKGROUND);
 
         rd_atomic32_sub(&rd_kafka_thread_cnt_curr, 1);
+}
+
+int rd_kafka_background_thread_main(void *arg) {
+        rd_kafka_t *rk = arg;
+
+        rd_kafka_background_thread_setup(rk);
+
+        while (likely(!rd_kafka_terminating(rk)))
+                rd_kafka_background_thread_serve(rk);
+
+        rd_kafka_background_thread_teardown(rk);
 
         return 0;
 }
+
+#ifdef __wasi__
+/**
+ * @brief One cooperative slice of the background handler.
+ * @returns non-zero once the handler has run to completion.
+ */
+static int rd_kafka_background_thread_step(void *arg) {
+        rd_kafka_t *rk = arg;
+
+        /* Deferred for the same reason as the main handler: registration
+         * happens under rk_init_lock, which the setup itself takes. */
+        if (!rk->rk_wasm_bg_started) {
+                rk->rk_wasm_bg_started = 1;
+                rd_kafka_background_thread_setup(rk);
+        }
+
+        if (rd_kafka_terminating(rk)) {
+                rd_kafka_background_thread_teardown(rk);
+                return 1;
+        }
+
+        rd_kafka_background_thread_serve(rk);
+
+        return 0;
+}
+#endif
 
 
 /**
@@ -161,7 +218,7 @@ int rd_kafka_background_thread_main(void *arg) {
 rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
                                                       char *errstr,
                                                       size_t errstr_size) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         sigset_t newset, oldset;
 #endif
 
@@ -176,7 +233,7 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
         mtx_lock(&rk->rk_init_lock);
         rk->rk_init_wait_cnt++;
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Block all signals in newly created threads.
          * To avoid race condition we block all signals in the calling
          * thread, which the new thread will inherit its sigmask from,
@@ -193,9 +250,13 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
 #endif
 
 
+#ifdef __wasi__
+        if (rd_wasm_task_add(rd_kafka_background_thread_step, rk, rk) != 0) {
+#else
         if ((thrd_create(&rk->rk_background.thread,
                          rd_kafka_background_thread_main, rk)) !=
             thrd_success) {
+#endif
                 rd_snprintf(errstr, errstr_size,
                             "Failed to create background thread: %s",
                             rd_strerror(errno));
@@ -204,7 +265,7 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
                 rk->rk_init_wait_cnt--;
                 mtx_unlock(&rk->rk_init_lock);
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
                 /* Restore sigmask of caller */
                 pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -213,7 +274,7 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
 
         mtx_unlock(&rk->rk_init_lock);
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
         /* Restore sigmask of caller */
         pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
