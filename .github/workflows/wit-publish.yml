@@ -52,11 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install wash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/wasmcloud/wasmCloud/main/install.sh | bash
-          echo "$HOME/.wash/bin" >> "$GITHUB_PATH"
+      - uses: wasmCloud/setup-wash-action@v2.1.0
 
       - name: Install wasm-tools
         # Only for the round-trip assertion below; `wash wit build` does the
@@ -170,13 +166,7 @@ jobs:
         with:
           name: kafka-wit
 
-      - name: Install wkg
-        run: |
-          set -euo pipefail
-          curl -fsSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/latest/download/wkg-$(uname -m)-unknown-linux-gnu" \
-            -o /tmp/wkg
-          sudo install /tmp/wkg /usr/local/bin/wkg
-          wkg --version
+      - uses: wasmCloud/setup-wash-action@v2.1.0
 
       - name: Resolve the conventional reference
         id: ref
@@ -191,11 +181,11 @@ jobs:
             version="${{ needs.validate.outputs.version }}"
           fi
 
-          # wkg ignores any tag that is not valid semver when resolving, so a
-          # `v` prefix or a codename would publish successfully and then be
-          # invisible to every consumer.
+          # Resolvers ignore any tag that is not valid semver, so a `v` prefix
+          # or a codename would publish successfully and then be invisible to
+          # every consumer.
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$ ]]; then
-            echo "::error::tag '$version' is not valid semver; wkg will ignore it when pulling"
+            echo "::error::tag '$version' is not valid semver; it would be ignored when pulling"
             exit 1
           fi
 
@@ -213,32 +203,35 @@ jobs:
         run: |
           set -euo pipefail
           ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
-          if wkg oci pull "$ref" -o /tmp/existing.wasm 2>/dev/null; then
+          if wash oci pull "$ref" /tmp/existing.wasm \
+               -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" >/dev/null 2>&1; then
             echo "::error::$ref already exists; bump the version in wit/ instead of moving the tag"
             exit 1
           fi
           echo "tag is free"
 
-      - name: Log in to the registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | wkg oci login "${OCI_REGISTRY}" -u "${{ github.actor }}" --password-stdin
-
       - name: Push
         run: |
           set -euo pipefail
           ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
-          wkg oci push "$ref" kafka-wit.wasm
+          wash oci push "$ref" kafka-wit.wasm \
+            -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
           echo "published $ref"
 
       - name: Verify what landed
-        # Pull it back and decode. Publishing an artifact nobody can resolve is
-        # the failure mode worth ten seconds to rule out.
+        # Read the WIT back out of the published reference — not a local copy.
+        # Publishing something no consumer can resolve is the failure this job
+        # exists to rule out, and only the round trip through the registry
+        # proves it. `wash inspect` takes an OCI reference directly, so this is
+        # exactly what a consumer would do.
         run: |
           set -euo pipefail
           ref="${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.version }}"
-          wkg oci pull "$ref" -o /tmp/pulled.wasm
-          wasm-tools component wit /tmp/pulled.wasm | grep -m1 '^package '
+          wash inspect "$ref" \
+            -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" > /tmp/published.wit
+          grep -m1 '^package ' /tmp/published.wit
+          grep -q '^package cosmonic:kafka@' /tmp/published.wit \
+            || { echo "::error::published artifact does not decode to cosmonic:kafka"; exit 1; }
 
       - name: Summary
         run: |
