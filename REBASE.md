@@ -73,9 +73,9 @@ cd tests && TESTS_SKIP_UNSUPPORTED=y RDKAFKA_TEST_CONF=/dev/null \
   ../build-native/tests/test-runner -l -Q
 
 # Cooperative path — against a real broker.
-bash wasi/ci/start-kafka.sh plaintext
-bash wasi/ci/run-test.sh producer_test.wasm wasi-producer-topic
-bash wasi/ci/run-test.sh consumer_test.wasm wasi-consumer-topic grp-check
+bash wasi-tests/ci/start-kafka.sh plaintext
+bash wasi-tests/ci/run-test.sh producer_test.wasm wasi-producer-topic
+bash wasi-tests/ci/run-test.sh consumer_test.wasm wasi-consumer-topic grp-check
 ```
 
 Both run in CI (`.github/workflows/wasi.yml`) on every push, so pushing the

@@ -82,8 +82,8 @@ jobs:
           # and wasi-sdk's 64 KB default overflows during fetch parsing.
           $WASI_SDK/bin/clang --target=wasm32-wasip2 \
             -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
-            -I src -I wasi -Wl,-z,stack-size=8388608 \
-            -o producer_test.wasm wasi/producer_test.c \
+            -I src -I wasi-tests -Wl,-z,stack-size=8388608 \
+            -o producer_test.wasm wasi-tests/producer_test.c \
             build-wasi/src/librdkafka.a \
             -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lm
 
@@ -201,23 +201,23 @@ jobs:
           for t in producer consumer; do
             $WASI_SDK/bin/clang --target=wasm32-wasip2 \
               -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
-              -I src -I wasi -Wl,-z,stack-size=8388608 \
-              -o ${t}_test.wasm wasi/${t}_test.c \
+              -I src -I wasi-tests -Wl,-z,stack-size=8388608 \
+              -o ${t}_test.wasm wasi-tests/${t}_test.c \
               build-wasi/src/librdkafka.a $EXTRA \
               -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lm
           done
 
       - name: Start Kafka
-        run: bash wasi/ci/start-kafka.sh "${{ matrix.mode }}" "${KAFKA_IMAGE}"
+        run: bash wasi-tests/ci/start-kafka.sh "${{ matrix.mode }}" "${KAFKA_IMAGE}"
 
       - name: Producer
-        run: bash wasi/ci/run-test.sh producer_test.wasm wasi-producer-topic
+        run: bash wasi-tests/ci/run-test.sh producer_test.wasm wasi-producer-topic
 
       - name: Consumer groups
         # The group protocol is the part most exposed to cooperative
         # scheduling — join, rebalance callbacks, heartbeats and commit all
         # interleave at pump points instead of owning a thread.
-        run: bash wasi/ci/run-test.sh consumer_test.wasm wasi-consumer-topic wasi-ci-${{ matrix.mode }}
+        run: bash wasi-tests/ci/run-test.sh consumer_test.wasm wasi-consumer-topic wasi-ci-${{ matrix.mode }}
 
       - name: Broker-side verification
         # Prove the broker actually stored the records rather than trusting the
