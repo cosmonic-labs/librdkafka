@@ -36,7 +36,7 @@ jobs:
       - name: Install wasi-sdk
         run: |
           set -euo pipefail
-          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
             "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_SDK_TAG}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
           mkdir -p /opt/wasi-sdk
           tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
@@ -44,11 +44,19 @@ jobs:
           /opt/wasi-sdk/bin/clang --version | head -1
 
       - name: Install wasm-tools
+        # Release assets embed the version (wasm-tools-1.255.0-x86_64-linux.tar.gz),
+        # so there is no stable `latest/download/...` URL to curl. Let gh resolve
+        # the newest release and match by pattern instead of guessing a filename.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/bytecodealliance/wasm-tools/releases/latest/download/wasm-tools-installer.sh" -o /tmp/i.sh 2>/dev/null \
-            || cargo install wasm-tools --locked
-          command -v wasm-tools || echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          gh release download --repo bytecodealliance/wasm-tools \
+            --pattern "wasm-tools-*-$(uname -m)-linux.tar.gz" \
+            --output /tmp/wt.tar.gz --clobber
+          tar xzf /tmp/wt.tar.gz -C /tmp
+          sudo install /tmp/wasm-tools-*/wasm-tools /usr/local/bin/
+          wasm-tools --version
 
       - name: Build librdkafka (no TLS)
         run: |
@@ -90,8 +98,20 @@ jobs:
       - name: Assert it is a component that reaches wasi:sockets
         run: |
           set -euo pipefail
-          wasm-tools print producer_test.wasm | head -1 | grep -q '(component' \
-            || { echo "::error::output is a core module, not a component"; exit 1; }
+
+          # Check the tool separately. Under `pipefail` a missing wasm-tools
+          # fails the pipeline below, the `||` fires, and the assertion reports
+          # "not a component" — blaming the artifact for a missing binary. A
+          # diagnostic that lies costs more than no diagnostic.
+          command -v wasm-tools >/dev/null \
+            || { echo "::error::wasm-tools is not installed; the install step above silently no-opped"; exit 1; }
+
+          first=$(wasm-tools print producer_test.wasm | head -1)
+          case "$first" in
+            *"(component"*) echo "component: yes" ;;
+            *) echo "::error::output is a core module, not a component (first line: $first)"; exit 1 ;;
+          esac
+
           echo "--- imports ---"
           wasm-tools component wit producer_test.wasm | grep -E "import wasi:" | sort -u
           wasm-tools component wit producer_test.wasm | grep -q "wasi:sockets/tcp" \
@@ -121,7 +141,7 @@ jobs:
       - name: Install wasi-sdk
         run: |
           set -euo pipefail
-          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
             "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_SDK_TAG}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
           mkdir -p /opt/wasi-sdk
           tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
@@ -130,7 +150,7 @@ jobs:
       - name: Install wasmtime
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
             | tar xJ -C /tmp
           sudo install "/tmp/wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/local/bin/
           wasmtime --version
@@ -149,7 +169,7 @@ jobs:
         if: matrix.mode == 'tls' && steps.ssl-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          curl -sSL -o /tmp/openssl.tar.gz \
+          curl -fsSL -o /tmp/openssl.tar.gz \
             "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
           mkdir -p /tmp/ossl && tar xzf /tmp/openssl.tar.gz -C /tmp/ossl --strip-components=1
           cd /tmp/ossl

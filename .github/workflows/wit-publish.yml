@@ -61,10 +61,19 @@ jobs:
       - name: Install wasm-tools
         # Only for the round-trip assertion below; `wash wit build` does the
         # encoding.
+        #
+        # Release assets embed the version (wasm-tools-1.255.0-x86_64-linux.tar.gz),
+        # so `latest/download/wasm-tools-x86_64-linux.tar.gz` 404s. Worse, a
+        # plain `curl -sSL` happily writes the 404 body and the failure surfaces
+        # as "gzip: stdin: not in gzip format" three lines later. Let gh resolve
+        # the release and match by pattern.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/bytecodealliance/wasm-tools/releases/latest/download/wasm-tools-$(uname -m)-linux.tar.gz" \
-            -o /tmp/wt.tar.gz
+          gh release download --repo bytecodealliance/wasm-tools \
+            --pattern "wasm-tools-*-$(uname -m)-linux.tar.gz" \
+            --output /tmp/wt.tar.gz --clobber
           tar xzf /tmp/wt.tar.gz -C /tmp
           sudo install /tmp/wasm-tools-*/wasm-tools /usr/local/bin/
 
@@ -164,7 +173,7 @@ jobs:
       - name: Install wkg
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/latest/download/wkg-$(uname -m)-unknown-linux-gnu" \
+          curl -fsSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/latest/download/wkg-$(uname -m)-unknown-linux-gnu" \
             -o /tmp/wkg
           sudo install /tmp/wkg /usr/local/bin/wkg
           wkg --version
