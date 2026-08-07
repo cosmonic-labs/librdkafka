@@ -99,22 +99,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Check the tool separately. Under `pipefail` a missing wasm-tools
-          # fails the pipeline below, the `||` fires, and the assertion reports
-          # "not a component" — blaming the artifact for a missing binary. A
-          # diagnostic that lies costs more than no diagnostic.
           command -v wasm-tools >/dev/null \
             || { echo "::error::wasm-tools is not installed; the install step above silently no-opped"; exit 1; }
 
-          first=$(wasm-tools print producer_test.wasm | head -1)
-          case "$first" in
-            *"(component"*) echo "component: yes" ;;
-            *) echo "::error::output is a core module, not a component (first line: $first)"; exit 1 ;;
-          esac
+          # `component wit` is the whole test: it succeeds only for a component,
+          # and for a core module fails with "input is a core wasm module with no
+          # `component-type*` custom sections".
+          #
+          # Do NOT reach for `wasm-tools print ... | head -1` here. Printing a
+          # 6.8 MB component emits an enormous WAT, `head` closes the pipe,
+          # wasm-tools takes SIGPIPE, and under `set -euo pipefail` the step dies
+          # with no output at all — reporting nothing rather than the thing you
+          # were trying to assert.
+          if ! wasm-tools component wit producer_test.wasm > /tmp/pt.wit 2>/tmp/pt.err; then
+            echo "::error::producer_test.wasm is not a valid component"
+            cat /tmp/pt.err
+            exit 1
+          fi
+          echo "component: yes"
 
           echo "--- imports ---"
-          wasm-tools component wit producer_test.wasm | grep -E "import wasi:" | sort -u
-          wasm-tools component wit producer_test.wasm | grep -q "wasi:sockets/tcp" \
+          grep -E "import wasi:" /tmp/pt.wit | sort -u
+          grep -q "wasi:sockets/tcp" /tmp/pt.wit \
             || { echo "::error::component does not import wasi:sockets/tcp"; exit 1; }
 
       - uses: actions/upload-artifact@v4
@@ -269,9 +275,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq libssl-dev zlib1g-dev
+          # CMAKE_ENABLE_EXPORTS adds -rdynamic to test-runner on ELF targets.
+          # 0066_plugins dlopens interceptor_test.so, which resolves `test_level`
+          # back out of the executable; without exported dynamic symbols that
+          # fails with "undefined symbol: test_level".
+          #
+          # This is an upstream gap rather than anything to do with this fork:
+          # tests/Makefile carries `LDFLAGS += -rdynamic` but tests/CMakeLists.txt
+          # does not, so 0066 cannot pass in a stock CMake test build. It is also
+          # invisible on macOS, where Mach-O exports executable symbols by default
+          # and the fixture is not built at all.
           cmake -S . -B build-native \
             -DRDKAFKA_BUILD_STATIC=ON -DRDKAFKA_BUILD_EXAMPLES=OFF \
-            -DRDKAFKA_BUILD_TESTS=ON -DWITH_SASL=OFF -DWITH_CURL=OFF
+            -DRDKAFKA_BUILD_TESTS=ON -DWITH_SASL=OFF -DWITH_CURL=OFF \
+            -DCMAKE_ENABLE_EXPORTS=ON
           cmake --build build-native -j"$(nproc)"
 
       - name: Stage the interceptor fixture
