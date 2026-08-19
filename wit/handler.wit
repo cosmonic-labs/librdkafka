@@ -37,13 +37,34 @@ package cosmonic:kafka@0.2.0;
 ///   different partitions concurrently, and that is where the parallelism comes
 ///   from: more of it means more partitions, the same answer Kafka gives every
 ///   other consumer.
-/// - **An error means "not handled".** The provider decides what follows —
-///   redelivery, and after some number of attempts a dead-letter topic — because
-///   holding a partition hostage to one bad batch stops every record behind it.
+/// - **An error means "not handled".** `transient` asks for redelivery;
+///   `permanent` says redelivery is pointless and the batch should be
+///   dead-lettered now, because holding a partition hostage to one bad batch
+///   stops every record behind it. A provider that only counts attempts has to
+///   wait out the retries to reach the same conclusion.
 @since(version = 0.2.0)
 interface handler {
     @since(version = 0.2.0)
-    use types.{consumed-record, error};
+    use types.{consumed-record};
+
+    /// Why a batch was not handled.
+    ///
+    /// A variant rather than `types.error`, for two reasons. The host requires
+    /// one: a provider *imports* this for a workload to export, and the call can
+    /// trap or the workload can stop mid-call, so the host has to be able to
+    /// build the error arm itself to report that — which it cannot do for a
+    /// record. And it is the better shape regardless, because the distinction
+    /// below is the one thing the handler knows and the provider cannot infer.
+    /// Without it a provider can only count attempts and hope.
+    @since(version = 0.2.0)
+    variant handler-error {
+        /// Try again. The batch may succeed later — a dependency was
+        /// unavailable, a lock was held, a quota was spent.
+        transient(option<string>),
+        /// Do not try again. This batch will never succeed, so redelivering it
+        /// only stalls the partition behind it; dead-letter it now.
+        permanent(option<string>),
+    }
 
     /// Handle one batch. Returning `ok` is what allows its offsets to be
     /// committed; returning an error asks for it to be delivered again.
@@ -52,5 +73,5 @@ interface handler {
     /// commits, and because a handler that does real work needs somewhere to
     /// await its own imports from.
     @since(version = 0.2.0)
-    handle: async func(records: list<consumed-record>) -> result<_, error>;
+    handle: async func(records: list<consumed-record>) -> result<_, handler-error>;
 }
