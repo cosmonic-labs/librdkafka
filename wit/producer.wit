@@ -1,6 +1,17 @@
-package cosmonic:kafka@0.1.0;
+package cosmonic:kafka@0.2.0;
 
 /// Producing records, including the idempotent and transactional paths.
+/// ## Every function is `async`
+///
+/// Including the ones that only read local state — `assignment`, `position`,
+/// `fatal-error` — which is not how they would be written for a native
+/// implementation. A host *component* plugin's capabilities are installed on a
+/// caller's linker as concurrent host functions, and a sync `func` fails to bind
+/// there with "type mismatch with async". One sync function is therefore enough
+/// to make the whole interface unservable from a component, and this package's
+/// `host-plugin` world describes exactly that deployment. An async lift costs a
+/// native implementation nothing — the body returns without suspending — so this
+/// is the version that both kinds of provider can serve.
 @since(version = 0.1.0)
 interface producer {
     @since(version = 0.1.0)
@@ -67,7 +78,7 @@ interface producer {
         /// reading while its local queue is full, instead of returning
         /// `queue-full`.
         @since(version = 0.1.0)
-        send-stream: func(topic: string, records: stream<produce-record>)
+        send-stream: async func(topic: string, records: stream<produce-record>)
             -> future<result<_, error>>;
 
         /// Wait for every queued record to be delivered or fail.
@@ -83,11 +94,11 @@ interface producer {
         /// outcome then becomes unknown — they may still have been written.
         /// Returns immediately; it does not wait for the queue to drain.
         @since(version = 0.1.0)
-        purge: func(in-flight: bool) -> result<_, error>;
+        purge: async func(in-flight: bool) -> result<_, error>;
 
         /// Records queued but not yet delivered.
         @since(version = 0.1.0)
-        in-flight-count: func() -> u32;
+        in-flight-count: async func() -> u32;
 
         /// Partition count for a topic, from cached metadata or a fresh fetch.
         @since(version = 0.1.0)
@@ -105,7 +116,7 @@ interface producer {
         /// producer, when ordering or exactly-once guarantees can no longer be
         /// upheld.
         @since(version = 0.1.0)
-        fatal-error: func() -> option<error>;
+        fatal-error: async func() -> option<error>;
     }
 
     /// A transaction on a producer.

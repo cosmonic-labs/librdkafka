@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.1.0;
+package cosmonic:kafka@0.2.0;
 
 /// Types shared by the producer, consumer and admin interfaces.
 @since(version = 0.1.0)

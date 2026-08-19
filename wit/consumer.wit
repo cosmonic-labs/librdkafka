@@ -1,6 +1,17 @@
-package cosmonic:kafka@0.1.0;
+package cosmonic:kafka@0.2.0;
 
 /// Consuming records, with and without consumer-group coordination.
+/// ## Every function is `async`
+///
+/// Including the ones that only read local state — `assignment`, `position`,
+/// `fatal-error` — which is not how they would be written for a native
+/// implementation. A host *component* plugin's capabilities are installed on a
+/// caller's linker as concurrent host functions, and a sync `func` fails to bind
+/// there with "type mismatch with async". One sync function is therefore enough
+/// to make the whole interface unservable from a component, and this package's
+/// `host-plugin` world describes exactly that deployment. An async lift costs a
+/// native implementation nothing — the body returns without suspending — so this
+/// is the version that both kinds of provider can serve.
 @since(version = 0.1.0)
 interface consumer {
     @since(version = 0.1.0)
@@ -71,7 +82,7 @@ interface consumer {
 
         /// The topics currently subscribed to.
         @since(version = 0.1.0)
-        subscription: func() -> result<list<string>, error>;
+        subscription: async func() -> result<list<string>, error>;
 
         /// Replace the assignment outright, bypassing group coordination.
         ///
@@ -93,16 +104,16 @@ interface consumer {
 
         /// The partitions currently assigned.
         @since(version = 0.1.0)
-        assignment: func() -> result<list<topic-partition>, error>;
+        assignment: async func() -> result<list<topic-partition>, error>;
 
         /// Whether the assignment was lost without a clean revoke. Offsets for
         /// a lost assignment can no longer be committed.
         @since(version = 0.1.0)
-        assignment-lost: func() -> bool;
+        assignment-lost: async func() -> bool;
 
         /// Which rebalance protocol the group negotiated.
         @since(version = 0.1.0)
-        rebalance-protocol: func() -> rebalance-protocol;
+        rebalance-protocol: async func() -> rebalance-protocol;
 
         /// The stream of records from the assigned partitions, plus a future
         /// carrying the terminal error if the stream ends abnormally.
@@ -115,7 +126,7 @@ interface consumer {
         /// The stream ends cleanly on `close`. It ends with an error in the
         /// future on a fatal client error.
         @since(version = 0.1.0)
-        records: func()
+        records: async func()
             -> tuple<stream<consumed-record>, future<result<_, error>>>;
 
         /// The stream of assignment changes.
@@ -128,14 +139,14 @@ interface consumer {
         /// assignment behaviour — but revocations then pass unobserved, which
         /// is how duplicate processing starts.
         @since(version = 0.1.0)
-        rebalances: func() -> stream<rebalance-event>;
+        rebalances: async func() -> stream<rebalance-event>;
 
         /// Mark offsets consumed locally, for a later commit.
         ///
         /// Only meaningful with `enable.auto.offset.store=false`. Store one
         /// past the last processed record.
         @since(version = 0.1.0)
-        store-offsets: func(offsets: list<topic-partition>)
+        store-offsets: async func(offsets: list<topic-partition>)
             -> result<_, error>;
 
         /// Commit progress to the group coordinator, resolving once the
@@ -158,7 +169,7 @@ interface consumer {
         /// Resolves once queued. The outcome is not reported — use `commit`
         /// where the result matters.
         @since(version = 0.1.0)
-        commit-async: func(offsets: list<topic-partition>)
+        commit-async: async func(offsets: list<topic-partition>)
             -> result<_, error>;
 
         /// The group's committed offsets for these partitions.
@@ -169,7 +180,7 @@ interface consumer {
         /// The current local read position, which may be ahead of what has
         /// been committed.
         @since(version = 0.1.0)
-        position: func(partitions: list<topic-partition>)
+        position: async func(partitions: list<topic-partition>)
             -> result<list<topic-partition>, error>;
 
         /// Move the read position. Takes effect on subsequent records.
@@ -181,11 +192,11 @@ interface consumer {
 
         /// Stop fetching these partitions while keeping them assigned.
         @since(version = 0.1.0)
-        pause: func(partitions: list<topic-partition>) -> result<_, error>;
+        pause: async func(partitions: list<topic-partition>) -> result<_, error>;
 
         /// Resume fetching paused partitions.
         @since(version = 0.1.0)
-        resume: func(partitions: list<topic-partition>) -> result<_, error>;
+        resume: async func(partitions: list<topic-partition>) -> result<_, error>;
 
         /// Low and high watermarks, queried from the broker.
         @since(version = 0.1.0)
@@ -213,6 +224,6 @@ interface consumer {
 
         /// The unrecoverable error this client has entered, if any.
         @since(version = 0.1.0)
-        fatal-error: func() -> option<error>;
+        fatal-error: async func() -> option<error>;
     }
 }

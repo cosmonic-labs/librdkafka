@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.1.0;
+package cosmonic:kafka@0.2.0;
 
 /// A workload that produces.
 @since(version = 0.1.0)
@@ -134,22 +134,21 @@ world client {
 /// workload that did not declare a topic should not be able to reach it, even
 /// though the broker-side ACL is the real enforcement point.
 ///
-/// ## Why consumption is pull-shaped
+/// ## Two shapes of delivery
 ///
-/// A native plugin pushes into workloads through host-side APIs that reach the
-/// workload registry (`call_handle_message`, `deliver_trigger_service_message`).
-/// A component plugin has no such path: its imports resolve against the host's
-/// *native* plugins, never against workloads. So it cannot invoke a
-/// `wasmcloud:messaging/handler`-style export on a workload, and delivery has
-/// to be initiated from the workload side.
+/// **Pull.** A workload holds a `consumer` resource and reads `records()`. The
+/// call is ingress, so the stream carries records outward without the provider
+/// calling in — and the consuming workload must be long-lived to hold it.
 ///
-/// `consumer.records()` returns a `stream<consumed-record>` that the plugin
-/// fills as records arrive. The call is ingress, so it is allowed; the stream
-/// then carries records outward without the plugin ever calling in. The cost is
-/// that the consuming workload must be long-lived to hold the stream.
+/// **Push.** The provider calls `handler.handle` on a workload that exports it,
+/// which frees the workload from being long-lived: it is started for a batch and
+/// retires when the burst drains. This was not possible when this package was
+/// first written — a component plugin's imports resolve against the host's own
+/// plugins, never against workloads — and `wasmcloud:host/workload-call` is what
+/// changed it. A plugin opens a target for a workload id and an interface and
+/// calls it. Both shapes are optional: a provider may serve either, and a
+/// consuming workload picks by importing `consumer` or exporting `handler`.
 ///
-/// If push delivery to ephemeral components is a requirement, this capability
-/// has to be a native plugin instead.
 @since(version = 0.1.0)
 world host-plugin {
     /// The capability itself, served across store boundaries to bound
@@ -169,15 +168,44 @@ world host-plugin {
     /// desired behaviour for bad credentials — fail at deploy, not at first
     /// send.
     @since(version = 0.1.0)
-    export wasmcloud:host/workload-lifecycle@0.1.1;
+    export wasmcloud:host/workload-lifecycle@0.1.3;
 
     /// Which workload is calling. Required: capability calls carry no binding
     /// identity, so this is the only way to select that tenant's client.
     @since(version = 0.1.0)
-    import wasmcloud:host/identity@0.1.1;
+    import wasmcloud:host/identity@0.1.3;
 
     /// Cooperative cancellation, so a long fetch can be unwound instead of
     /// occupying the plugin instance.
     @since(version = 0.1.0)
-    import wasmcloud:host/cancel@0.1.1;
+    import wasmcloud:host/cancel@0.1.3;
+
+    /// The push path, and it is optional: a provider that only serves `consumer`
+    /// never opens a target. `handler` is *imported* here because the workload
+    /// is the one that exports it — a plugin calls in, rather than being called.
+    @since(version = 0.2.0)
+    import handler;
+    @since(version = 0.2.0)
+    import wasmcloud:host/workload-call@0.1.3;
+}
+
+/// A workload that is *given* records rather than reading them.
+///
+/// The push counterpart to `consumer-service`, and the reason it exists: this
+/// component holds no consumer, no stream, and no group membership, so it can be
+/// per-request. It is started when there is a batch and retires when there is
+/// not, which is what makes a bursty topic scale to the work and back down.
+@since(version = 0.2.0)
+world record-handler {
+    @since(version = 0.2.0)
+    import types;
+
+    /// Handling a batch usually means producing something. Importing `producer`
+    /// here rather than defining a second world is deliberate: the read side is
+    /// the export, so this stays one world with both directions.
+    @since(version = 0.2.0)
+    import producer;
+
+    @since(version = 0.2.0)
+    export handler;
 }

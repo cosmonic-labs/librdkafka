@@ -43,3 +43,6 @@ wit/deps/
 # Out-of-tree CMake build directories (build-native, build-wasi, build-ssl, ...).
 # Upstream's .gitignore covers `build/` only.
 build-*/
+
+# `wash wit build` output, regenerable from wit/
+/kafka-*.wasm
