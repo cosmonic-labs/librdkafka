@@ -133,11 +133,19 @@ jobs:
             grep -qE "^world $w \{" decoded.wit \
               || { echo "::error::world '$w' missing from encoded package"; exit 1; }
           done
-          # The error enum is the bulk of the interface's value and the part
+          # The error codes are the bulk of the interface's value and the part
           # most likely to be silently truncated by an encoding change.
-          cases=$(sed -n '/enum error-code/,/^  }/p' decoded.wit | grep -cE '^\s+[a-z][a-z0-9-]*,$')
+          # A `variant` since 0.2.0, so cases may carry a payload —
+          # `unknown-error-code(s32)` does, which is what makes the set
+          # non-exhaustive. Count both forms.
+          cases=$(sed -n '/variant error-code/,/^  }/p' decoded.wit \
+            | grep -cE '^\s+[a-z][a-z0-9-]*(\([^)]*\))?,$')
           echo "error-code cases: $cases"
-          [ "$cases" -ge 180 ] || { echo "::error::error-code enum truncated ($cases cases)"; exit 1; }
+          [ "$cases" -ge 180 ] || { echo "::error::error-code truncated ($cases cases)"; exit 1; }
+          # The escape hatch itself: without it a code from a newer broker has
+          # nowhere to land, which is the whole reason this is a variant.
+          grep -qE '^\s+unknown-error-code\(s32\),$' decoded.wit \
+            || { echo "::error::unknown-error-code(s32) is missing; the set is exhaustive again"; exit 1; }
 
       - name: Check the enum still matches librdkafka
         # The enum is generated from rd_kafka_resp_err_t. If the vendored

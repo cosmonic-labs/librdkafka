@@ -50,10 +50,13 @@ def header_codes() -> set[str]:
 
 def wit_codes() -> set[str]:
     text = WIT.read_text()
-    m = re.search(r"enum error-code \{(.*?)\n    \}", text, re.S)
+    m = re.search(r"variant error-code \{(.*?)\n    \}", text, re.S)
     if not m:
-        sys.exit(f"error: could not find `enum error-code` in {WIT}")
-    return set(re.findall(r"^\s{8}([a-z][a-z0-9-]*),$", m.group(1), re.M))
+        sys.exit(f"error: could not find `variant error-code` in {WIT}")
+    # `variant` since 0.2.0, so a case may carry a payload. Only the name maps
+    # to an `rd_kafka_resp_err_t`; `unknown-error-code(s32)` is this interface's
+    # own escape hatch and has no counterpart, so it is excluded below.
+    return set(re.findall(r"^\s{8}([a-z][a-z0-9-]*)(?:\([^)]*\))?,$", m.group(1), re.M))
 
 
 def main() -> int:
