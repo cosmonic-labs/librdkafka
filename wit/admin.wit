@@ -10,7 +10,7 @@ package cosmonic:kafka@0.2.0;
 interface admin {
     @since(version = 0.1.0)
     use types.{
-        config-entry, error, topic-partition, partition, offset,
+        config-entry, error, partition-ref, partition-offset, partition-result, partition, offset,
         uuid, timestamp-ms
     };
 
@@ -132,7 +132,7 @@ interface admin {
         client-host: string,
         /// Set for a static member (`group.instance.id`).
         group-instance-id: option<string>,
-        assignment: list<topic-partition>,
+        assignment: list<partition-ref>,
     }
 
     @since(version = 0.1.0)
@@ -217,8 +217,8 @@ interface admin {
         /// Delete every record before the given offset in each partition.
         @since(version = 0.1.0)
         delete-records: async func(
-            offsets: list<topic-partition>
-        ) -> result<list<topic-partition>, error>;
+            offsets: list<partition-offset>
+        ) -> result<list<partition-result>, error>;
 
         // --- configuration ------------------------------------------------
 
@@ -257,9 +257,9 @@ interface admin {
         /// Offsets matching a spec, per partition.
         @since(version = 0.1.0)
         list-offsets: async func(
-            partitions: list<topic-partition>,
+            partitions: list<partition-ref>,
             spec: offset-spec
-        ) -> result<list<topic-partition>, error>;
+        ) -> result<list<partition-result>, error>;
 
         // --- consumer groups ----------------------------------------------
 
@@ -283,23 +283,23 @@ interface admin {
         @since(version = 0.1.0)
         list-consumer-group-offsets: async func(
             group-id: string,
-            partitions: list<topic-partition>
-        ) -> result<list<topic-partition>, error>;
+            partitions: list<partition-ref>
+        ) -> result<list<partition-result>, error>;
 
         /// Overwrite a group's committed offsets. The group must have no
         /// active members, or the brokers reject it.
         @since(version = 0.1.0)
         alter-consumer-group-offsets: async func(
             group-id: string,
-            offsets: list<topic-partition>
-        ) -> result<list<topic-partition>, error>;
+            offsets: list<partition-offset>
+        ) -> result<list<partition-result>, error>;
 
         /// Delete a group's committed offsets for these partitions.
         @since(version = 0.1.0)
         delete-consumer-group-offsets: async func(
             group-id: string,
-            partitions: list<topic-partition>
-        ) -> result<list<topic-partition>, error>;
+            partitions: list<partition-ref>
+        ) -> result<list<partition-result>, error>;
 
         // --- access control -----------------------------------------------
 
