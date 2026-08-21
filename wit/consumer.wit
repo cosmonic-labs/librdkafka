@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.2.0;
+package cosmonic:kafka@0.3.0;
 
 /// Consuming records, with and without consumer-group coordination.
 /// ## Every function is `async`

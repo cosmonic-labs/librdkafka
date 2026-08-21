@@ -1,6 +1,6 @@
-package cosmonic:kafka@0.2.0;
+package cosmonic:kafka@0.3.0;
 
-/// Types shared by the producer, consumer and admin interfaces.
+/// Types shared by the producer and consumer interfaces.
 @since(version = 0.1.0)
 interface types {
     /// Milliseconds since the Unix epoch.
@@ -114,13 +114,6 @@ interface types {
         low: offset,
         /// Offset that will be assigned to the next record produced.
         high: offset,
-    }
-
-    /// A Kafka UUID, as the protocol encodes it.
-    @since(version = 0.1.0)
-    record uuid {
-        most-significant: s64,
-        least-significant: s64,
     }
 
     /// A client configuration property.

@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.2.0;
+package cosmonic:kafka@0.3.0;
 
 /// Receiving records that a provider pushed, rather than reading a stream.
 ///

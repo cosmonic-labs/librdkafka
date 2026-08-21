@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.2.0;
+package cosmonic:kafka@0.3.0;
 
 /// A workload that produces.
 @since(version = 0.1.0)
@@ -67,22 +67,6 @@ world processor-service {
 
     @since(version = 0.1.0)
     export wasi:cli/run@0.3.0;
-}
-
-/// A workload with the full capability, including administration.
-///
-/// Producing and admin work from an ephemeral component; consuming does not —
-/// use `consumer-service` for that.
-@since(version = 0.1.0)
-world client {
-    @since(version = 0.1.0)
-    import types;
-    @since(version = 0.1.0)
-    import producer;
-    @since(version = 0.1.0)
-    import consumer;
-    @since(version = 0.1.0)
-    import admin;
 }
 
 /// The Kafka capability implemented as a wasmCloud host component plugin.
@@ -159,8 +143,6 @@ world host-plugin {
     export producer;
     @since(version = 0.1.0)
     export consumer;
-    @since(version = 0.1.0)
-    export admin;
 
     /// Per-workload provisioning. `on-workload-bind` receives the interface
     /// config above and is where this plugin opens that workload's client;

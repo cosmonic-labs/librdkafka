@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.2.0;
+package cosmonic:kafka@0.3.0;
 
 /// Producing records, including the idempotent and transactional paths.
 /// ## Every function is `async`
