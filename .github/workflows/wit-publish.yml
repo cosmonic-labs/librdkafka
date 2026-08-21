@@ -129,7 +129,7 @@ jobs:
           wasm-tools component wit kafka-wit.wasm > decoded.wit
           grep -q '^package cosmonic:kafka@' decoded.wit \
             || { echo "::error::decoded package name is wrong"; exit 1; }
-          for w in producer-client consumer-service processor-service client host-plugin; do
+          for w in producer-client consumer-service processor-service host-plugin record-handler; do
             grep -qE "^world $w \{" decoded.wit \
               || { echo "::error::world '$w' missing from encoded package"; exit 1; }
           done
