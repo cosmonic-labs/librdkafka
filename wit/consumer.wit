@@ -118,43 +118,42 @@ interface consumer {
         /// The stream of records from the assigned partitions, plus a future
         /// carrying the terminal error if the stream ends abnormally.
         ///
-        /// May be taken once per consumer. Reading it is what drives group
-        /// heartbeats, so it must be read continuously even when the records
-        /// are not needed — a consumer whose stream is parked is a consumer
-        /// about to be evicted.
+        /// **Callable once.** A second call fails with `invalid-arg` rather
+        /// than handing back a second reader: two readers of one consumer would
+        /// each receive part of the stream, and neither could tell that it had.
+        ///
+        /// Reading it is what drives group heartbeats, so it must be read
+        /// continuously even when the records are not needed — a consumer whose
+        /// stream is parked is a consumer about to be evicted.
         ///
         /// The stream ends cleanly on `close`. It ends with an error in the
         /// future on a fatal client error.
         @since(version = 0.1.0)
-        /// **Callable once.** A second call fails with `invalid-arg` rather
-        /// than handing back a second reader: two readers of one consumer would
-        /// each receive part of the stream, and neither could tell that it had.
         records: async func()
             -> result<tuple<stream<consumed-record>, future<result<_, error>>>, error>;
 
         /// The stream of assignment changes.
         ///
-        /// May be taken once per consumer. Rebalances are a stream rather than
-        /// a callback because a WIT import cannot call back into the guest;
-        /// this is the async counterpart of librdkafka's `rebalance_cb`.
+        /// **Callable once**, for the same reason as `records`.
+        ///
+        /// Rebalances are a stream rather than a callback because a WIT import
+        /// cannot call back into the guest; this is the async counterpart of
+        /// librdkafka's `rebalance_cb`.
         ///
         /// Ignoring it is not fatal — the client falls back to its default
         /// assignment behaviour — but revocations then pass unobserved, which
         /// is how duplicate processing starts.
         @since(version = 0.1.0)
-        /// **Callable once**, for the same reason as `records`.
         rebalances: async func() -> result<stream<rebalance-event>, error>;
 
-        /// Mark offsets consumed locally, for a later commit.
+        /// Commit progress to the group coordinator, resolving once the
+        /// coordinator confirms. This is a broker round trip, not a local
+        /// note: what it writes is what a restart resumes from.
         ///
-        /// Only meaningful with `enable.auto.offset.store=false`. Store one
-        /// past the last processed record.
-        @since(version = 0.1.0)
-            /// Commit progress to the group coordinator, resolving once the
-        /// coordinator confirms.
-        ///
-        /// An empty `offsets` commits the current stored positions. The result
-        /// reports per-partition outcomes.
+        /// Offsets are the position to resume at, so one past the last record
+        /// processed. An empty `offsets` commits the positions already stored
+        /// for the records this consumer has been handed. The result reports
+        /// per-partition outcomes.
         ///
         /// # Typical errors
         /// - `rebalance-in-progress`: the group is moving; re-join and retry.
@@ -164,12 +163,14 @@ interface consumer {
         commit: async func(offsets: list<partition-offset>)
             -> result<list<partition-result>, error>;
 
-        /// Queue a commit without waiting for confirmation.
+        /// The group's committed offsets for these partitions, read from the
+        /// coordinator.
         ///
-        /// Resolves once queued. The outcome is not reported — use `commit`
-        /// where the result matters.
+        /// This asks what was committed; it commits nothing. An empty
+        /// `partitions` asks about the current assignment. What a restart
+        /// would resume from, as against `position`, which is where this
+        /// consumer has read to locally.
         @since(version = 0.1.0)
-            /// The group's committed offsets for these partitions.
         committed: async func(partitions: list<partition-ref>)
             -> result<list<partition-result>, error>;
 

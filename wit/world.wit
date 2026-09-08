@@ -100,7 +100,7 @@ world processor-service {
 /// hostInterfaces:
 ///   - namespace: cosmonic
 ///     package: kafka
-///     version: "0.1.0"
+///     version: "0.3.0"
 ///     interfaces: [producer, consumer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
@@ -110,13 +110,20 @@ world processor-service {
 ///       - kafka-credentials            # sasl.username, sasl.password, ...
 /// ```
 ///
-/// Every key is passed to librdkafka verbatim, so any auth mechanism it
-/// supports works unchanged: SASL/PLAIN, SCRAM-SHA-256/512, OAUTHBEARER,
-/// GSSAPI, or mTLS via `ssl.key.pem` / `ssl.certificate.pem`.
+/// Every key is passed to librdkafka verbatim, so any auth mechanism the
+/// provider's build actually links works unchanged: SASL/PLAIN,
+/// SCRAM-SHA-256/512, OAUTHBEARER, and mTLS via `ssl.key.pem` /
+/// `ssl.certificate.pem` are the usual set. GSSAPI needs cyrus-sasl linked in,
+/// which many builds leave out; a provider that does reports `invalid-config`
+/// for `sasl.mechanism=GSSAPI` rather than pretending.
 ///
-/// The plugin should treat this config as the whole permission grant — a
-/// workload that did not declare a topic should not be able to reach it, even
-/// though the broker-side ACL is the real enforcement point.
+/// The plugin should treat `topics` as the whole permission grant for the calls
+/// a guest makes: `producer.send`, `consumer.subscribe`, and anything else that
+/// names a topic. A workload that did not declare a topic should not be able to
+/// reach it, even though the broker-side ACL is the real enforcement point.
+///
+/// `group.id` here is an ordinary librdkafka property, passed through for the
+/// consumer a guest opens itself. Handlers use their own key, below.
 ///
 /// ## Two shapes of delivery
 ///
@@ -132,6 +139,45 @@ world processor-service {
 /// changed it. A plugin opens a target for a workload id and an interface and
 /// calls it. Both shapes are optional: a provider may serve either, and a
 /// consuming workload picks by importing `consumer` or exporting `handler`.
+///
+/// ### Configuring a handler
+///
+/// A handler never calls `open`, so everything it needs comes from the same
+/// interface config that bounds a guest's own calls. The two want different
+/// answers, so the push path has its own keys:
+///
+/// ```yaml
+/// hostInterfaces:
+///   - namespace: cosmonic
+///     package: kafka
+///     version: "0.3.0"
+///     interfaces: [handler]
+///     config:
+///       bootstrap.servers: kafka.svc:9092
+///       handler.topics: orders             # dispatched from
+///       handler.group.id: orders-processor # the group this handler joins
+///       dead-letter.topic: orders.dlq      # where `permanent` goes
+///       topics: orders,orders.enriched     # what its own sends may reach
+/// ```
+///
+/// `handler.topics` is the subscription and nothing else. It cannot be
+/// `topics`, because a handler that reads one topic and writes another has to
+/// be dispatched from the first and allowed to produce to the second. Put the
+/// output in one shared key and the handler subscribes to its own output; leave
+/// it out and the send is denied.
+///
+/// `handler.group.id` is the group the provider's consumer joins. It needs its
+/// own key because this config is also merged over a guest's `open` arguments
+/// with the host winning, so a plain `group.id` would move every consumer the
+/// guest opens into the handler's group.
+///
+/// `dead-letter.topic` is where a `permanent` batch goes, and a provider should
+/// require it. Past whatever redelivery bound it applies there is nowhere else
+/// for the batch, leaving a stalled partition or a dropped record.
+///
+/// Refuse a handler binding missing any of the three at bind, not at first
+/// dispatch. Otherwise it is a handler that never runs, which looks the same as
+/// a topic with no traffic.
 ///
 @since(version = 0.1.0)
 world host-plugin {
