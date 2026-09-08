@@ -120,15 +120,12 @@ interface types {
     ///
     /// Free-form key/value rather than an enumerated record: librdkafka accepts
     /// several hundred properties and adds more each release, so enumerating
-    /// them would pin this interface to one version. An unknown or malformed
-    /// key is reported as `invalid-config` when the client is opened.
-    @since(version = 0.1.0)
-    /// One configuration property.
-    ///
-    /// Keys are librdkafka property names, passed verbatim, which is what lets
-    /// any mechanism librdkafka supports work without this interface enumerating
-    /// them: `bootstrap.servers`, `acks`, `compression.type`, `group.id`,
-    /// `sasl.mechanism`, `ssl.key.pem`, and so on.
+    /// them would pin this interface to one version. Keys are librdkafka
+    /// property names, passed verbatim — `bootstrap.servers`, `acks`,
+    /// `compression.type`, `group.id`, `sasl.mechanism`, `ssl.key.pem`, and so
+    /// on — which is what lets any mechanism librdkafka supports work without
+    /// this interface enumerating them. An unknown or malformed key is reported
+    /// as `invalid-config` when the client is opened.
     ///
     /// **A provider must reject a property it does not implement** with
     /// `invalid-config`, rather than ignoring it. Silently dropping
@@ -137,6 +134,7 @@ interface types {
     /// connection proceeds unauthenticated. Both are worse than failing to
     /// open. A provider implementing a subset is expected; one that pretends to
     /// implement more than it does is not.
+    @since(version = 0.1.0)
     record config-entry {
         key: string,
         value: string,

@@ -110,9 +110,12 @@ world processor-service {
 ///       - kafka-credentials            # sasl.username, sasl.password, ...
 /// ```
 ///
-/// Every key is passed to librdkafka verbatim, so any auth mechanism it
-/// supports works unchanged: SASL/PLAIN, SCRAM-SHA-256/512, OAUTHBEARER,
-/// GSSAPI, or mTLS via `ssl.key.pem` / `ssl.certificate.pem`.
+/// Every key is passed to librdkafka verbatim, so any auth mechanism the
+/// provider's build actually links works unchanged: SASL/PLAIN,
+/// SCRAM-SHA-256/512, OAUTHBEARER, and mTLS via `ssl.key.pem` /
+/// `ssl.certificate.pem` are the usual set. GSSAPI needs cyrus-sasl linked in,
+/// which many builds leave out; a provider that does reports `invalid-config`
+/// for `sasl.mechanism=GSSAPI` rather than pretending.
 ///
 /// The plugin should treat `topics` as the whole permission grant for the calls
 /// a guest makes: `producer.send`, `consumer.subscribe`, and anything else that
