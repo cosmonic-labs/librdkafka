@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.4.0;
+package cosmonic:kafka@0.5.0;
 
 /// A workload that publishes without owning a Kafka client.
 @since(version = 0.1.0)
@@ -14,8 +14,8 @@ world producer-client {
 world transactional-producer-client {
     @since(version = 0.4.0)
     import types;
-    @since(version = 0.4.0)
-    import transactional;
+    @since(version = 0.5.0)
+    import transaction;
 }
 
 /// A long-lived pull consumer service.
@@ -37,7 +37,7 @@ world consumer-service {
 
 /// A long-lived transactional read-process-write service.
 ///
-/// The consumer and transactional bindings must name the same consumer group
+/// The consumer and transaction bindings must name the same consumer group
 /// when offsets and produced records need to commit atomically.
 @since(version = 0.1.0)
 world processor-service {
@@ -45,8 +45,8 @@ world processor-service {
     import types;
     @since(version = 0.1.0)
     import consumer;
-    @since(version = 0.4.0)
-    import transactional;
+    @since(version = 0.5.0)
+    import transaction;
 
     @since(version = 0.1.0)
     export wasi:cli/run@0.3.0;
@@ -74,7 +74,7 @@ world processor-service {
 ///
 /// - one ordinary producer may be shared by concurrent instances of a component
 ///   using the same producer binding;
-/// - a transactional binding owns a producer with one active transaction slot;
+/// - a transaction binding owns a producer with one active transaction slot;
 /// - every `consumer.open()` creates a distinct, bounded consumer session; and
 /// - a handler binding owns the consumer and dispatches batches into the
 ///   workload.
@@ -106,7 +106,7 @@ world processor-service {
 /// hostInterfaces:
 ///   - namespace: cosmonic
 ///     package: kafka
-///     version: "0.4.0"
+///     version: "0.5.0"
 ///     interfaces: [producer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
@@ -129,7 +129,7 @@ world processor-service {
 ///   - name: orders-reader
 ///     namespace: cosmonic
 ///     package: kafka
-///     version: "0.4.0"
+///     version: "0.5.0"
 ///     interfaces: [consumer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
@@ -157,8 +157,8 @@ world processor-service {
 ///   - name: orders-tx
 ///     namespace: cosmonic
 ///     package: kafka
-///     version: "0.4.0"
-///     interfaces: [transactional]
+///     version: "0.5.0"
+///     interfaces: [transaction]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
 ///       topics: orders.input,orders.output
@@ -169,7 +169,7 @@ world processor-service {
 /// `transactional.id` is required and must remain stable across restart for
 /// Kafka fencing and recovery. `transaction.group.id` is required only when
 /// the workload calls `send-offsets`. The guest cannot select a group at call
-/// time. A binding must not grant both `producer` and `transactional` over the
+/// time. A binding must not grant both `producer` and `transaction` over the
 /// same native producer; declare separate bindings when both are needed.
 /// Every simultaneously live replica needs a distinct stable transactional ID;
 /// reusing one across hosts causes Kafka producer fencing.
@@ -180,7 +180,7 @@ world processor-service {
 /// hostInterfaces:
 ///   - namespace: cosmonic
 ///     package: kafka
-///     version: "0.4.0"
+///     version: "0.5.0"
 ///     interfaces: [handler, producer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
@@ -200,7 +200,7 @@ world processor-service {
 ///
 /// The provider should reject a handler binding that omits
 /// `bootstrap.servers`, `handler.topics`, `handler.group.id` or
-/// `dead-letter.topic` during binding. It should also reject a transactional
+/// `dead-letter.topic` during binding. It should also reject a transaction
 /// binding without `transactional.id` and resource settings above host ceilings
 /// before work is scheduled. A pull consumer without `consumer.group.id`
 /// remains valid for manual assignment; its `subscribe` call fails.
@@ -228,8 +228,8 @@ world host-plugin {
     export types;
     @since(version = 0.1.0)
     export producer;
-    @since(version = 0.4.0)
-    export transactional;
+    @since(version = 0.5.0)
+    export transaction;
     @since(version = 0.1.0)
     export consumer;
 
