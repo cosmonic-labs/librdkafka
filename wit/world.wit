@@ -1,6 +1,6 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
-/// A workload that produces.
+/// A workload that publishes without owning a Kafka client.
 @since(version = 0.1.0)
 world producer-client {
     @since(version = 0.1.0)
@@ -9,35 +9,20 @@ world producer-client {
     import producer;
 }
 
-/// A long-lived consumer **service**.
+/// A workload that publishes Kafka transactions without consuming.
+@since(version = 0.4.0)
+world transactional-producer-client {
+    @since(version = 0.4.0)
+    import types;
+    @since(version = 0.4.0)
+    import transactional;
+}
+
+/// A long-lived pull consumer service.
 ///
-/// Consuming is a service, not a component. A wasmCloud component is
-/// instantiated per request and torn down after it, which leaves nowhere to
-/// hold a record stream, and — more importantly — nothing to drive the group
-/// heartbeat between requests. A consumer that stops reading is a consumer the
-/// group evicts.
-///
-/// A service instead exports `wasi:cli/run`, which the host calls once at
-/// startup and expects to block indefinitely. That single long-lived call is
-/// what owns the `stream<consumed-record>` and keeps the membership alive.
-///
-/// The shape of `run` is a loop over the stream:
-///
-/// ```text
-/// let consumer = consumer::open(config).await?;
-/// consumer.subscribe(topics).await?;
-/// let (records, done) = consumer.records();
-/// loop {
-///     select {
-///         rec = records.next() => { process(rec); consumer.commit(..).await?; }
-///         ev  = rebalances.next() => { /* commit before revoke */ }
-///     }
-/// }
-/// ```
-///
-/// Handle `rebalances` in the same loop. Records and assignment changes arrive
-/// on separate streams, and committing an offset for a partition that has
-/// already been revoked is where duplicate processing starts.
+/// The service owns a `consumer` resource and continuously reads its record
+/// stream. It remains alive to drive polling and group membership. Event-driven
+/// components should export `handler` instead.
 @since(version = 0.1.0)
 world consumer-service {
     @since(version = 0.1.0)
@@ -45,25 +30,23 @@ world consumer-service {
     @since(version = 0.1.0)
     import consumer;
 
-    /// Called once at startup; blocks for the life of the service.
+    /// Called once and expected to run for the service lifetime.
     @since(version = 0.1.0)
     export wasi:cli/run@0.3.0;
 }
 
-/// A long-lived read-process-write **service**.
+/// A long-lived transactional read-process-write service.
 ///
-/// Consumes, transforms, and produces from the one instance. Combined with
-/// `transaction.send-offsets`, this is the exactly-once pattern: the offsets
-/// consumed and the records produced commit atomically, so a crash mid-batch
-/// replays cleanly instead of double-writing.
+/// The consumer and transactional bindings must name the same consumer group
+/// when offsets and produced records need to commit atomically.
 @since(version = 0.1.0)
 world processor-service {
     @since(version = 0.1.0)
     import types;
     @since(version = 0.1.0)
     import consumer;
-    @since(version = 0.1.0)
-    import producer;
+    @since(version = 0.4.0)
+    import transactional;
 
     @since(version = 0.1.0)
     export wasi:cli/run@0.3.0;
@@ -71,166 +54,215 @@ world processor-service {
 
 /// The Kafka capability implemented as a wasmCloud host component plugin.
 ///
-/// One long-lived, host-scoped instance serves every workload that binds to it.
-/// That split is the point: a Kafka client is stateful — connections to every
-/// broker, cached metadata, partition leadership, group membership with
-/// heartbeats — and none of it survives a per-request component instance.
+/// One long-lived host-scoped plugin serves every workload, while each workload
+/// binding retains its own Kafka identity, authorization and resource accounting.
 ///
-/// ## Per-workload clients
+/// ## Bindings are capabilities
 ///
-/// The plugin does not hold one shared Kafka client. Kafka authorises per
-/// principal (ACLs on topics and groups), so a shared client would give every
-/// workload identical rights and defeat the isolation the sandbox exists to
-/// provide. Instead `on-workload-bind` delivers each workload's own
-/// `bootstrap.servers`, credentials and topic set, and the plugin opens a
-/// client per workload, keyed by workload id.
+/// A guest never supplies a broker, credential, group or arbitrary client
+/// property to a WIT function. The workload's resolved host-interface binding
+/// supplies them before the component runs. A plain import uses the unnamed
+/// binding. A named import, written with `(implements ...)`, selects a named
+/// binding and is the explicit way to grant another cluster, principal, group
+/// or client policy.
 ///
-/// Later capability calls carry no binding information, so the plugin
-/// correlates them back with `wasmcloud:host/identity.get-workload-id()`. That
-/// identity is the only thing distinguishing one tenant's calls from another's,
-/// which makes the `identity` import mandatory rather than a convenience.
+/// A provider must retain interface declarations per binding. Unioning all
+/// `cosmonic:kafka` interfaces across a component can grant a named import an
+/// interface declared only on another binding.
 ///
-/// ## Credentials
+/// The provider owns native clients:
 ///
-/// A workload declares them on its interface binding, and the host merges
-/// `config` -> `configFrom` -> `secretFrom` (last wins) before delivering the
-/// result as this binding's config:
+/// - one ordinary producer may be shared by concurrent instances of a component
+///   using the same producer binding;
+/// - a transactional binding owns a producer with one active transaction slot;
+/// - every `consumer.open()` creates a distinct, bounded consumer session; and
+/// - a handler binding owns the consumer and dispatches batches into the
+///   workload.
+///
+/// Clients and their queues are bounded host resources. A provider must enforce
+/// limits on binding count, live pull consumers, streams, buffered bytes and
+/// native client configuration.
+///
+/// ## Binding configuration
+///
+/// Configuration is resolved from `config`, `configFrom` and `secretFrom`
+/// according to the host's layering rules. Broker addresses and non-secret
+/// policy usually live in `config`; credentials belong in `secretFrom`.
+///
+/// `topics` is a comma-separated authorization grant for guest-selected topic
+/// operations. Absence grants no guest-selected topic. `*` grants every topic
+/// allowed by the Kafka principal. The provider checks it for producing,
+/// subscribing, assigning, seeking, offset operations and metadata queries. A
+/// finite literal grant cannot safely authorize a regex subscription.
+///
+/// The remaining keys are native Kafka client properties unless the provider
+/// documents a narrower portable subset. Unknown, malformed or unsupported
+/// properties fail binding or client initialization; silently ignoring a
+/// durability, authentication or isolation property changes the contract.
+///
+/// ### Ordinary producer
 ///
 /// ```yaml
 /// hostInterfaces:
 ///   - namespace: cosmonic
 ///     package: kafka
-///     version: "0.3.0"
-///     interfaces: [producer, consumer]
+///     version: "0.4.0"
+///     interfaces: [producer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
-///       group.id: orders-processor
-///       topics: orders,payments        # what this workload may consume
+///       topics: orders.created,orders.updated
+///       acks: all
+///       compression.type: zstd
 ///     secretFrom:
-///       - kafka-credentials            # sasl.username, sasl.password, ...
+///       - kafka-orders-credentials
 /// ```
 ///
-/// Every key is passed to librdkafka verbatim, so any auth mechanism the
-/// provider's build actually links works unchanged: SASL/PLAIN,
-/// SCRAM-SHA-256/512, OAUTHBEARER, and mTLS via `ssl.key.pem` /
-/// `ssl.certificate.pem` are the usual set. GSSAPI needs cyrus-sasl linked in,
-/// which many builds leave out; a provider that does reports `invalid-config`
-/// for `sasl.mechanism=GSSAPI` rather than pretending.
+/// The imported interface is the producer capability. There is no producer
+/// `open`, `close` or global `flush`: each send operation reports its own
+/// delivery outcome, and the provider retains the shared native client for the
+/// binding lifecycle.
 ///
-/// The plugin should treat `topics` as the whole permission grant for the calls
-/// a guest makes: `producer.send`, `consumer.subscribe`, and anything else that
-/// names a topic. A workload that did not declare a topic should not be able to
-/// reach it, even though the broker-side ACL is the real enforcement point.
+/// ### Pull consumer
 ///
-/// `group.id` here is an ordinary librdkafka property, passed through for the
-/// consumer a guest opens itself. Handlers use their own key, below.
+/// ```yaml
+/// hostInterfaces:
+///   - name: orders-reader
+///     namespace: cosmonic
+///     package: kafka
+///     version: "0.4.0"
+///     interfaces: [consumer]
+///     config:
+///       bootstrap.servers: kafka.svc:9092
+///       topics: orders.created,orders.updated
+///       consumer.group.id: order-indexer
+///       auto.offset.reset: earliest
+///       enable.auto.commit: "false"
+///       isolation.level: read_committed
+/// ```
 ///
-/// ## Two shapes of delivery
+/// `consumer.group.id` is translated to the native client's `group.id`.
+/// Keeping the plugin-owned spelling distinct prevents the same binding's
+/// producer client from receiving a consumer-only property. Without it, the
+/// guest may use manual assignment but `subscribe` fails with
+/// `invalid-group-id`.
 ///
-/// **Pull.** A workload holds a `consumer` resource and reads `records()`. The
-/// call is ingress, so the stream carries records outward without the provider
-/// calling in — and the consuming workload must be long-lived to hold it.
+/// Several `open()` calls create several bounded members of the same group.
+/// If a binding configures `group.instance.id`, a provider should permit only
+/// one live handle because duplicate static identities fence each other.
 ///
-/// **Push.** The provider calls `handler.handle` on a workload that exports it,
-/// which frees the workload from being long-lived: it is started for a batch and
-/// retires when the burst drains. This was not possible when this package was
-/// first written — a component plugin's imports resolve against the host's own
-/// plugins, never against workloads — and `wasmcloud:host/workload-call` is what
-/// changed it. A plugin opens a target for a workload id and an interface and
-/// calls it. Both shapes are optional: a provider may serve either, and a
-/// consuming workload picks by importing `consumer` or exporting `handler`.
+/// ### Transactional producer
 ///
-/// ### Configuring a handler
+/// ```yaml
+/// hostInterfaces:
+///   - name: orders-tx
+///     namespace: cosmonic
+///     package: kafka
+///     version: "0.4.0"
+///     interfaces: [transactional]
+///     config:
+///       bootstrap.servers: kafka.svc:9092
+///       topics: orders.input,orders.output
+///       transactional.id: order-processor-0
+///       transaction.group.id: order-processor
+/// ```
 ///
-/// A handler never calls `open`, so everything it needs comes from the same
-/// interface config that bounds a guest's own calls. The two want different
-/// answers, so the push path has its own keys:
+/// `transactional.id` is required and must remain stable across restart for
+/// Kafka fencing and recovery. `transaction.group.id` is required only when
+/// the workload calls `send-offsets`. The guest cannot select a group at call
+/// time. A binding must not grant both `producer` and `transactional` over the
+/// same native producer; declare separate bindings when both are needed.
+/// Every simultaneously live replica needs a distinct stable transactional ID;
+/// reusing one across hosts causes Kafka producer fencing.
+///
+/// ### Host-driven handler
 ///
 /// ```yaml
 /// hostInterfaces:
 ///   - namespace: cosmonic
 ///     package: kafka
-///     version: "0.3.0"
-///     interfaces: [handler]
+///     version: "0.4.0"
+///     interfaces: [handler, producer]
 ///     config:
 ///       bootstrap.servers: kafka.svc:9092
-///       handler.topics: orders             # dispatched from
-///       handler.group.id: orders-processor # the group this handler joins
-///       dead-letter.topic: orders.dlq      # where `permanent` goes
-///       topics: orders,orders.enriched     # what its own sends may reach
+///       topics: orders.input,orders.output,orders.dlq
+///       handler.topics: orders.input
+///       handler.group.id: order-transformer
+///       handler.batch.size: "32"
+///       dead-letter.topic: orders.dlq
 /// ```
 ///
-/// `handler.topics` is the subscription and nothing else. It cannot be
-/// `topics`, because a handler that reads one topic and writes another has to
-/// be dispatched from the first and allowed to produce to the second. Put the
-/// output in one shared key and the handler subscribes to its own output; leave
-/// it out and the send is denied.
+/// `handler.topics` is the subscription; `topics` is the authorization
+/// ceiling for all topic operations on the binding. The names differ because a
+/// handler often reads one topic and produces to another. `handler.group.id`
+/// is the provider-owned consumer group. `handler.batch.size` is the maximum
+/// records dispatched in one call. `dead-letter.topic` receives a permanent
+/// failure and must itself be inside the topic grant.
 ///
-/// `handler.group.id` is the group the provider's consumer joins. It needs its
-/// own key because this config is also merged over a guest's `open` arguments
-/// with the host winning, so a plain `group.id` would move every consumer the
-/// guest opens into the handler's group.
+/// The provider should reject a handler binding that omits
+/// `bootstrap.servers`, `handler.topics`, `handler.group.id` or
+/// `dead-letter.topic` during binding. It should also reject a transactional
+/// binding without `transactional.id` and resource settings above host ceilings
+/// before work is scheduled. A pull consumer without `consumer.group.id`
+/// remains valid for manual assignment; its `subscribe` call fails.
 ///
-/// `dead-letter.topic` is where a `permanent` batch goes, and a provider should
-/// require it. Past whatever redelivery bound it applies there is nowhere else
-/// for the batch, leaving a stalled partition or a dropped record.
+/// ## Consumption models
 ///
-/// Refuse a handler binding missing any of the three at bind, not at first
-/// dispatch. Otherwise it is a handler that never runs, which looks the same as
-/// a topic with no traffic.
+/// A pull consumer is a stateful service API. Its resource owns group
+/// membership, assignment, positions, streams, paused partitions and close.
+/// The no-argument constructor prevents a guest from selecting a different
+/// Kafka identity while preserving advanced controls such as manual assignment,
+/// seek and explicit commits.
 ///
+/// A handler is the serverless API. The provider polls Kafka and keeps group
+/// membership stable, then invokes a component only when a partition has work.
+/// Calls from different partitions may run concurrently. Calls for one
+/// partition remain ordered and do not overlap. Scaling compute therefore does
+/// not add one Kafka group member per Wasm instance.
+///
+/// Handler delivery is at least once. Offsets move only after the handler
+/// reports progress. A trap, timeout, stopped workload, provider restart or
+/// uncertain handoff can redeliver records, so handlers must be idempotent.
 @since(version = 0.1.0)
 world host-plugin {
-    /// The capability itself, served across store boundaries to bound
-    /// workloads.
     @since(version = 0.1.0)
     export types;
     @since(version = 0.1.0)
     export producer;
+    @since(version = 0.4.0)
+    export transactional;
     @since(version = 0.1.0)
     export consumer;
 
-    /// Per-workload provisioning. `on-workload-bind` receives the interface
-    /// config above and is where this plugin opens that workload's client;
-    /// returning an error there fails the workload's deployment, which is the
-    /// desired behaviour for bad credentials — fail at deploy, not at first
-    /// send.
+    /// Per-workload provisioning and cleanup.
     @since(version = 0.1.0)
     export wasmcloud:host/workload-lifecycle@0.1.3;
 
-    /// Which workload is calling. Required: capability calls carry no binding
-    /// identity, so this is the only way to select that tenant's client.
+    /// Identifies the calling workload for capability and metric routing.
     @since(version = 0.1.0)
     import wasmcloud:host/identity@0.1.3;
 
-    /// Cooperative cancellation, so a long fetch can be unwound instead of
-    /// occupying the plugin instance.
+    /// Cooperative cancellation for long Kafka operations.
     @since(version = 0.1.0)
     import wasmcloud:host/cancel@0.1.3;
 
-    /// The push path, and it is optional: a provider that only serves `consumer`
-    /// never opens a target. `handler` is *imported* here because the workload
-    /// is the one that exports it — a plugin calls in, rather than being called.
+    /// Imported because the workload exports it and the plugin calls into it.
     @since(version = 0.2.0)
     import handler;
     @since(version = 0.2.0)
     import wasmcloud:host/workload-call@0.1.3;
 }
 
-/// A workload that is *given* records rather than reading them.
+/// A workload that receives Kafka batches on demand.
 ///
-/// The push counterpart to `consumer-service`, and the reason it exists: this
-/// component holds no consumer, no stream, and no group membership, so it can be
-/// per-request. It is started when there is a batch and retires when there is
-/// not, which is what makes a bursty topic scale to the work and back down.
+/// The provider owns polling, heartbeats, assignment, retries and commits. The
+/// workload holds no consumer resource, so instances can appear for active
+/// partitions and retire when the burst drains.
 @since(version = 0.2.0)
 world record-handler {
     @since(version = 0.2.0)
     import types;
 
-    /// Handling a batch usually means producing something. Importing `producer`
-    /// here rather than defining a second world is deliberate: the read side is
-    /// the export, so this stays one world with both directions.
+    /// Handling a batch commonly produces a result through the same binding.
     @since(version = 0.2.0)
     import producer;
 

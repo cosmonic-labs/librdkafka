@@ -1,142 +1,73 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
-/// Producing records, including the idempotent and transactional paths.
-/// ## Every function is `async`
+/// Binding-scoped Kafka publishing.
 ///
-/// Including the ones that only read local state — which is not how they
-/// would be written for a native
-/// implementation. A host *component* plugin's capabilities are installed on a
-/// caller's linker as concurrent host functions, and a sync `func` fails to bind
-/// there with "type mismatch with async". One sync function is therefore enough
-/// to make the whole interface unservable from a component, and this package's
-/// `host-plugin` world describes exactly that deployment. An async lift costs a
-/// native implementation nothing — the body returns without suspending — so this
-/// is the version that both kinds of provider can serve.
+/// Importing this interface grants a component one producer capability. The
+/// import binding fixes the brokers, credentials, transport, client policy and
+/// topic grant before the component runs. A named import selects a different
+/// admitted binding; no function accepts a connection or client configuration.
+///
+/// The provider owns and reuses the native producer behind the binding. It may
+/// share connections, metadata and batching state across concurrent component
+/// instances without exposing that client as guest-owned state. Each operation
+/// still has its own completion boundary, so one invocation never needs to
+/// flush another invocation's queue.
+///
+/// Every function is `async`. A host component plugin installs concurrent host
+/// functions on the caller's linker, and a synchronous function cannot be
+/// served by that path.
 @since(version = 0.1.0)
 interface producer {
-    @since(version = 0.1.0)
-    use types.{
-        config-entry, error, produce-record, produce-ack, partition-offset,
-        partition, watermarks
-    };
+    @since(version = 0.4.0)
+    use types.{error, produce-record, produce-ack, partition, watermarks};
 
-    /// A producer client.
+    /// Produce one record and resolve with its delivery report.
     ///
-    /// Expensive to open and cheap to reuse: it holds connections to every
-    /// broker, cached topic metadata and partition leadership. Open one and
-    /// keep it for the lifetime of the workload. Opening one per request redoes
-    /// metadata discovery every time and defeats batching, which is the whole
-    /// reason Kafka producers are fast.
-    @since(version = 0.1.0)
-    resource producer {
-        /// Open a producer.
-        ///
-        /// `config` takes librdkafka property names verbatim
-        /// (`bootstrap.servers`, `acks`, `compression.type`, `linger.ms`,
-        /// `transactional.id`, `enable.idempotence`, ...). `bootstrap.servers`
-        /// is required.
-        ///
-        /// Resolves once the client is constructed, which does not imply a
-        /// broker connection — the first `send` reports connectivity failures.
-        ///
-        /// # Typical errors
-        /// - `invalid-config`: an unknown or malformed property.
-        /// - `invalid-arg`: `bootstrap.servers` missing or unparseable.
-        @since(version = 0.1.0)
-        open: static async func(config: list<config-entry>)
-            -> result<producer, error>;
-
-        /// Produce one record, resolving when the broker acknowledges it under
-        /// the configured `acks`.
-        ///
-        /// # Typical errors
-        /// - `msg-timed-out`: not acknowledged within `message.timeout.ms`.
-        /// - `queue-full`: local queue at `queue.buffering.max.messages`.
-        /// - `unknown-topic-or-part`: topic absent and auto-create disabled.
-        /// - `not-leader-for-partition`: leadership moved; retriable after the
-        ///   client refreshes metadata, which it does on its own.
-        @since(version = 0.1.0)
-        send: async func(topic: string, %record: produce-record)
-            -> result<produce-ack, error>;
-
-        /// Produce many records to one topic, batched into as few requests as
-        /// the partitioning allows.
-        ///
-        /// Strictly preferable to awaiting `send` in a loop, which serialises
-        /// round trips and prevents batching. The result list is positional —
-        /// entry N is the outcome of record N — so a partial failure is
-        /// reported per record instead of failing the whole call.
-        @since(version = 0.1.0)
-        send-batch: async func(topic: string, records: list<produce-record>)
-            -> result<list<result<produce-ack, error>>, error>;
-
-        /// Stream records to a topic, resolving when every record that entered
-        /// the stream has been acknowledged or failed.
-        ///
-        /// For continuous producing, where the caller does not want to size a
-        /// batch. Backpressure comes from the stream: the producer stops
-        /// reading while its local queue is full, instead of returning
-        /// `queue-full`.
-        @since(version = 0.1.0)
-        send-stream: async func(topic: string, records: stream<produce-record>)
-            -> future<result<_, error>>;
-
-        /// Wait for every queued record to be delivered or fail.
-        ///
-        /// Await this before dropping the resource when records were produced
-        /// through `send-stream`, otherwise queued records are discarded.
-        @since(version = 0.1.0)
-        flush: async func() -> result<_, error>;
-
-        /// Partition count for a topic, from cached metadata or a fresh fetch.
-        @since(version = 0.1.0)
-        partition-count: async func(topic: string) -> result<u32, error>;
-
-        /// Low and high watermarks for a partition.
-        @since(version = 0.1.0)
-        watermark-offsets: async func(topic: string, partition: partition)
-            -> result<watermarks, error>;
-
-        }
-
-    /// A transaction on a producer.
+    /// The provider must check `topic` against this binding's topic grant
+    /// before enqueueing the record.
     ///
-    /// Requires `transactional.id` in the producer config, which implies
-    /// `enable.idempotence`. The lifecycle is strict: `begin`, then produce,
-    /// then `commit` or `abort`.
+    /// # Typical errors
+    /// - `msg-timed-out`: not acknowledged within `message.timeout.ms`.
+    /// - `queue-full`: the binding's bounded local queue is full.
+    /// - `unknown-topic-or-part`: the topic is absent and auto-create is off.
+    /// - `not-leader-for-partition`: leadership moved; retry after refresh.
+    @since(version = 0.4.0)
+    send: async func(topic: string, %record: produce-record)
+        -> result<produce-ack, error>;
+
+    /// Produce many records to one topic.
     ///
-    /// On any failure check `error.txn-requires-abort`: when set, the only
-    /// legal next call is `abort`. When `error.fatal` is set the producer
-    /// itself is finished and must be reopened.
-    @since(version = 0.1.0)
-    resource transaction {
-        /// Register the producer with its transaction coordinator, fencing any
-        /// previous instance using the same `transactional.id`, and open a
-        /// transaction.
-        ///
-        /// Fencing is the point: it is what makes a restarted producer safe.
-        @since(version = 0.1.0)
-        begin: static async func(%producer: borrow<producer>)
-            -> result<transaction, error>;
+    /// The result is positional: entry N is the delivery outcome for record N.
+    /// Records are enqueued before their delivery reports are awaited so the
+    /// provider can batch them. A record rejected before enqueue appears as an
+    /// error in its position; it does not fail unrelated entries.
+    @since(version = 0.4.0)
+    send-batch: async func(topic: string, records: list<produce-record>)
+        -> result<list<result<produce-ack, error>>, error>;
 
-        /// Add consumer offsets to this transaction so consuming and producing
-        /// commit atomically — the read-process-write pattern.
-        ///
-        /// `group-id` is the consuming group; `offsets` are the positions to
-        /// commit, normally one past the last record processed.
-        @since(version = 0.1.0)
-        send-offsets: async func(
-            offsets: list<partition-offset>,
-            group-id: string
-        ) -> result<_, error>;
+    /// Produce a stream of records with backpressure.
+    ///
+    /// The provider stops reading while its bounded queues are full. The
+    /// returned future resolves only after the input ends and every record the
+    /// provider accepted has a delivery outcome. A record becomes accepted when
+    /// the provider has reserved its bounded capacity and taken it from the
+    /// input stream. If the workload, binding or provider stops first, the
+    /// future reports an error because accepted records may have an unknown
+    /// outcome.
+    ///
+    /// A provider may impose a documented per-record size limit when its
+    /// component runtime cannot determine a streamed item's size before
+    /// lowering it into host memory.
+    @since(version = 0.4.0)
+    send-stream: async func(topic: string, records: stream<produce-record>)
+        -> future<result<_, error>>;
 
-        /// Flush outstanding records and commit.
-        @since(version = 0.1.0)
-        commit: async func() -> result<_, error>;
+    /// Partition count for a granted topic.
+    @since(version = 0.4.0)
+    partition-count: async func(topic: string) -> result<u32, error>;
 
-        /// Discard the transaction. Records already produced are marked
-        /// aborted and are never delivered to `read_committed` consumers.
-        @since(version = 0.1.0)
-        abort: async func() -> result<_, error>;
-    }
+    /// Low and high watermarks for a granted topic partition.
+    @since(version = 0.4.0)
+    watermark-offsets: async func(topic: string, partition: partition)
+        -> result<watermarks, error>;
 }

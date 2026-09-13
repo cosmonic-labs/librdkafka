@@ -1,6 +1,12 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
-/// Consuming records, with and without consumer-group coordination.
+/// Binding-scoped Kafka consumption, with and without group coordination.
+///
+/// The import binding is the consumer capability: it fixes the Kafka identity
+/// and client policy before execution. The returned resource remains explicit
+/// because it owns real session state — group membership, assignment, cursor,
+/// paused partitions, streams and shutdown — and several resources opened from
+/// one binding are distinct members of its configured group.
 /// ## Every function is `async`
 ///
 /// Including the ones that only read local state —
@@ -16,7 +22,7 @@ package cosmonic:kafka@0.3.0;
 interface consumer {
     @since(version = 0.1.0)
     use types.{
-        config-entry, error, consumed-record, partition-ref, partition-offset,
+        error, consumed-record, partition-ref, partition-offset,
         partition-result, partition, position, watermarks, timestamp-ms
     };
 
@@ -54,25 +60,28 @@ interface consumer {
     /// — the async equivalent of exceeding `max.poll.interval.ms`.
     @since(version = 0.1.0)
     resource consumer {
-        /// Open a consumer.
+        /// Open a consumer from this import binding.
         ///
-        /// librdkafka property names verbatim (`bootstrap.servers`,
-        /// `group.id`, `auto.offset.reset`, `enable.auto.commit`,
-        /// `isolation.level`, ...). `group.id` is required for `subscribe`;
-        /// without it only manual `assign` is available.
+        /// The binding fixes the brokers, credentials, group identity, offset
+        /// behavior, isolation level, assignment strategy, fetch policy and
+        /// client limits before the component runs. Guest code cannot provide
+        /// or override a client property. `consumer.group.id` is required for
+        /// `subscribe`; without it only manual `assign` is available.
         ///
         /// # Typical errors
         /// - `invalid-config`: an unknown or malformed property.
         /// - `invalid-group-id`: `group.id` missing or rejected.
-        @since(version = 0.1.0)
-        open: static async func(config: list<config-entry>)
-            -> result<consumer, error>;
+        @since(version = 0.4.0)
+        open: static async func() -> result<consumer, error>;
 
         /// Join a group and let it assign partitions for these topics.
         ///
         /// Replaces any previous subscription. A name beginning with `^` is
         /// treated as a regular expression. Resolving does not mean partitions
         /// are assigned — that arrives on `rebalances` once the group settles.
+        /// A provider must reject a regular expression when the binding has a
+        /// finite literal topic grant, because comparing the expression text to
+        /// that list cannot prove which topics it will match.
         @since(version = 0.1.0)
         subscribe: async func(topics: list<string>) -> result<_, error>;
 
@@ -118,7 +127,7 @@ interface consumer {
         /// The stream of records from the assigned partitions, plus a future
         /// carrying the terminal error if the stream ends abnormally.
         ///
-        /// **Callable once.** A second call fails with `invalid-arg` rather
+        /// **Callable once.** A second call fails with `state` rather
         /// than handing back a second reader: two readers of one consumer would
         /// each receive part of the stream, and neither could tell that it had.
         ///
@@ -134,7 +143,8 @@ interface consumer {
 
         /// The stream of assignment changes.
         ///
-        /// **Callable once**, for the same reason as `records`.
+        /// **Callable once.** A second call fails with `state`, for the same
+        /// reason as `records`.
         ///
         /// Rebalances are a stream rather than a callback because a WIT import
         /// cannot call back into the guest; this is the async counterpart of
@@ -160,6 +170,7 @@ interface consumer {
         /// - `illegal-generation` / `unknown-member-id`: this member was
         ///   evicted, and these offsets are no longer this consumer's to
         ///   commit.
+        @since(version = 0.1.0)
         commit: async func(offsets: list<partition-offset>)
             -> result<list<partition-result>, error>;
 
