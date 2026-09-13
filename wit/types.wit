@@ -169,8 +169,10 @@ interface types {
         code: error-code,
         /// Human-readable detail. Not stable; do not parse it.
         message: string,
-        /// The client is unusable and must be reopened. Reached mainly by the
-        /// idempotent and transactional producer.
+        /// The native client is unusable. A provider rebuilds a binding-owned
+        /// producer before its next operation; a workload holding a consumer
+        /// resource must close it and open a new consumer. Reached mainly by
+        /// the idempotent and transactional producer.
         fatal: bool,
         /// The identical operation may be retried as-is.
         retriable: bool,
