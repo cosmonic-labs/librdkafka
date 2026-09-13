@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
 /// Receiving records that a provider pushed, rather than reading a stream.
 ///
@@ -9,10 +9,17 @@ package cosmonic:kafka@0.3.0;
 /// only when there is a batch for it, so the workload can be an ordinary
 /// per-request component that does not exist between batches.
 ///
-/// That shape is what a bursty topic wants. A hundred records arriving at once
-/// become a hundred records dispatched across as many instances as the host
-/// chooses to start, which retire when the burst drains — rather than one
-/// long-lived consumer working through them in series.
+/// That shape is what a bursty topic wants: instances start when there is work
+/// and retire when the burst drains, rather than one long-lived consumer
+/// holding a stream between bursts.
+///
+/// How *wide* that goes is the partition count, not the record count. A
+/// provider reads each partition independently and calls a workload with a
+/// batch from one of them, so a hundred records spread over ten partitions can
+/// occupy ten instances at once, while a hundred on a single partition are one
+/// call after another — the same ordering rule Kafka gives every consumer.
+/// Size partitions for the concurrency you want; replicas and pools divide
+/// that up, they do not multiply it.
 ///
 /// ## This is possible from a host component plugin
 ///

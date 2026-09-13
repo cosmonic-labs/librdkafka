@@ -1,4 +1,4 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
 /// Types shared by the producer and consumer interfaces.
 @since(version = 0.1.0)
@@ -116,32 +116,6 @@ interface types {
         high: offset,
     }
 
-    /// A client configuration property.
-    ///
-    /// Free-form key/value rather than an enumerated record: librdkafka accepts
-    /// several hundred properties and adds more each release, so enumerating
-    /// them would pin this interface to one version. An unknown or malformed
-    /// key is reported as `invalid-config` when the client is opened.
-    @since(version = 0.1.0)
-    /// One configuration property.
-    ///
-    /// Keys are librdkafka property names, passed verbatim, which is what lets
-    /// any mechanism librdkafka supports work without this interface enumerating
-    /// them: `bootstrap.servers`, `acks`, `compression.type`, `group.id`,
-    /// `sasl.mechanism`, `ssl.key.pem`, and so on.
-    ///
-    /// **A provider must reject a property it does not implement** with
-    /// `invalid-config`, rather than ignoring it. Silently dropping
-    /// `acks=all` weakens a durability guarantee the caller thinks it has, and
-    /// silently dropping `sasl.password` sends credentials nowhere while the
-    /// connection proceeds unauthenticated. Both are worse than failing to
-    /// open. A provider implementing a subset is expected; one that pretends to
-    /// implement more than it does is not.
-    record config-entry {
-        key: string,
-        value: string,
-    }
-
     /// A record read from a partition.
     @since(version = 0.1.0)
     record consumed-record {
@@ -195,8 +169,10 @@ interface types {
         code: error-code,
         /// Human-readable detail. Not stable; do not parse it.
         message: string,
-        /// The client is unusable and must be reopened. Reached mainly by the
-        /// idempotent and transactional producer.
+        /// The native client is unusable. A provider rebuilds a binding-owned
+        /// producer before its next operation; a workload holding a consumer
+        /// resource must close it and open a new consumer. Reached mainly by
+        /// the idempotent and transactional producer.
         fatal: bool,
         /// The identical operation may be retried as-is.
         retriable: bool,
@@ -305,7 +281,7 @@ interface types {
         unsupported-feature,
         /// Awaiting cache update (client-side, code -164)
         wait-cache,
-        /// Operation interrupted (e.g., due to yield)) (client-side, code
+        /// Operation interrupted (e.g., due to yield) (client-side, code
         /// -163)
         intr,
         /// Key serialization error (client-side, code -162)

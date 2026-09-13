@@ -1,6 +1,12 @@
-package cosmonic:kafka@0.3.0;
+package cosmonic:kafka@0.4.0;
 
-/// Consuming records, with and without consumer-group coordination.
+/// Binding-scoped Kafka consumption, with and without group coordination.
+///
+/// The import binding is the consumer capability: it fixes the Kafka identity
+/// and client policy before execution. The returned resource remains explicit
+/// because it owns real session state — group membership, assignment, cursor,
+/// paused partitions, streams and shutdown — and several resources opened from
+/// one binding are distinct members of its configured group.
 /// ## Every function is `async`
 ///
 /// Including the ones that only read local state —
@@ -16,7 +22,7 @@ package cosmonic:kafka@0.3.0;
 interface consumer {
     @since(version = 0.1.0)
     use types.{
-        config-entry, error, consumed-record, partition-ref, partition-offset,
+        error, consumed-record, partition-ref, partition-offset,
         partition-result, partition, position, watermarks, timestamp-ms
     };
 
@@ -54,25 +60,28 @@ interface consumer {
     /// — the async equivalent of exceeding `max.poll.interval.ms`.
     @since(version = 0.1.0)
     resource consumer {
-        /// Open a consumer.
+        /// Open a consumer from this import binding.
         ///
-        /// librdkafka property names verbatim (`bootstrap.servers`,
-        /// `group.id`, `auto.offset.reset`, `enable.auto.commit`,
-        /// `isolation.level`, ...). `group.id` is required for `subscribe`;
-        /// without it only manual `assign` is available.
+        /// The binding fixes the brokers, credentials, group identity, offset
+        /// behavior, isolation level, assignment strategy, fetch policy and
+        /// client limits before the component runs. Guest code cannot provide
+        /// or override a client property. `consumer.group.id` is required for
+        /// `subscribe`; without it only manual `assign` is available.
         ///
         /// # Typical errors
         /// - `invalid-config`: an unknown or malformed property.
         /// - `invalid-group-id`: `group.id` missing or rejected.
-        @since(version = 0.1.0)
-        open: static async func(config: list<config-entry>)
-            -> result<consumer, error>;
+        @since(version = 0.4.0)
+        open: static async func() -> result<consumer, error>;
 
         /// Join a group and let it assign partitions for these topics.
         ///
         /// Replaces any previous subscription. A name beginning with `^` is
         /// treated as a regular expression. Resolving does not mean partitions
         /// are assigned — that arrives on `rebalances` once the group settles.
+        /// A provider must reject a regular expression when the binding has a
+        /// finite literal topic grant, because comparing the expression text to
+        /// that list cannot prove which topics it will match.
         @since(version = 0.1.0)
         subscribe: async func(topics: list<string>) -> result<_, error>;
 
@@ -118,58 +127,61 @@ interface consumer {
         /// The stream of records from the assigned partitions, plus a future
         /// carrying the terminal error if the stream ends abnormally.
         ///
-        /// May be taken once per consumer. Reading it is what drives group
-        /// heartbeats, so it must be read continuously even when the records
-        /// are not needed — a consumer whose stream is parked is a consumer
-        /// about to be evicted.
+        /// **Callable once.** A second call fails with `state` rather
+        /// than handing back a second reader: two readers of one consumer would
+        /// each receive part of the stream, and neither could tell that it had.
+        ///
+        /// Reading it is what drives group heartbeats, so it must be read
+        /// continuously even when the records are not needed — a consumer whose
+        /// stream is parked is a consumer about to be evicted.
         ///
         /// The stream ends cleanly on `close`. It ends with an error in the
         /// future on a fatal client error.
         @since(version = 0.1.0)
-        /// **Callable once.** A second call fails with `invalid-arg` rather
-        /// than handing back a second reader: two readers of one consumer would
-        /// each receive part of the stream, and neither could tell that it had.
         records: async func()
             -> result<tuple<stream<consumed-record>, future<result<_, error>>>, error>;
 
         /// The stream of assignment changes.
         ///
-        /// May be taken once per consumer. Rebalances are a stream rather than
-        /// a callback because a WIT import cannot call back into the guest;
-        /// this is the async counterpart of librdkafka's `rebalance_cb`.
+        /// **Callable once.** A second call fails with `state`, for the same
+        /// reason as `records`.
+        ///
+        /// Rebalances are a stream rather than a callback because a WIT import
+        /// cannot call back into the guest; this is the async counterpart of
+        /// librdkafka's `rebalance_cb`.
         ///
         /// Ignoring it is not fatal — the client falls back to its default
         /// assignment behaviour — but revocations then pass unobserved, which
         /// is how duplicate processing starts.
         @since(version = 0.1.0)
-        /// **Callable once**, for the same reason as `records`.
         rebalances: async func() -> result<stream<rebalance-event>, error>;
 
-        /// Mark offsets consumed locally, for a later commit.
+        /// Commit progress to the group coordinator, resolving once the
+        /// coordinator confirms. This is a broker round trip, not a local
+        /// note: what it writes is what a restart resumes from.
         ///
-        /// Only meaningful with `enable.auto.offset.store=false`. Store one
-        /// past the last processed record.
-        @since(version = 0.1.0)
-            /// Commit progress to the group coordinator, resolving once the
-        /// coordinator confirms.
-        ///
-        /// An empty `offsets` commits the current stored positions. The result
-        /// reports per-partition outcomes.
+        /// Offsets are the position to resume at, so one past the last record
+        /// processed. An empty `offsets` commits the positions already stored
+        /// for the records this consumer has been handed. The result reports
+        /// per-partition outcomes.
         ///
         /// # Typical errors
         /// - `rebalance-in-progress`: the group is moving; re-join and retry.
         /// - `illegal-generation` / `unknown-member-id`: this member was
         ///   evicted, and these offsets are no longer this consumer's to
         ///   commit.
+        @since(version = 0.1.0)
         commit: async func(offsets: list<partition-offset>)
             -> result<list<partition-result>, error>;
 
-        /// Queue a commit without waiting for confirmation.
+        /// The group's committed offsets for these partitions, read from the
+        /// coordinator.
         ///
-        /// Resolves once queued. The outcome is not reported — use `commit`
-        /// where the result matters.
+        /// This asks what was committed; it commits nothing. An empty
+        /// `partitions` asks about the current assignment. What a restart
+        /// would resume from, as against `position`, which is where this
+        /// consumer has read to locally.
         @since(version = 0.1.0)
-            /// The group's committed offsets for these partitions.
         committed: async func(partitions: list<partition-ref>)
             -> result<list<partition-result>, error>;
 
